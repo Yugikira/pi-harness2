@@ -1,0 +1,13 @@
+{"type":"session","id":"sample-real-session","timestamp":"2026-10-26T00:00:00.000Z"}
+{"type":"message","message":{"role":"user","content":"Run research script and compile report."}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"w1","name":"write","arguments":{"path":"script1.py","content":"print(1)"}}]}}
+{"type":"message","message":{"role":"toolResult","toolCallId":"w1","toolName":"write","isError":false,"content":[{"type":"text","text":"Wrote script1.py"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"w2","name":"write","arguments":{"path":"script2.py","content":"print(2)"}}]}}
+{"type":"message","message":{"role":"toolResult","toolCallId":"w2","toolName":"write","isError":false,"content":[{"type":"text","text":"Wrote script2.py"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"w3","name":"write","arguments":{"path":"script3.py","content":"print(3)"}}]}}
+{"type":"message","message":{"role":"toolResult","toolCallId":"w3","toolName":"write","isError":false,"content":[{"type":"text","text":"Wrote script3.py"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"b1","name":"bash","arguments":{"command":"python script1.py"}}]}}
+{"type":"message","message":{"role":"toolResult","toolCallId":"b1","toolName":"bash","isError":true,"content":[{"type":"text","text":"UnicodeEncodeError: 'gbk' codec can't encode character '\\xe4' in position 23"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"b2","name":"bash","arguments":{"command":"python -c \"import sys; sys.stdout.reconfigure(encoding='utf-8'); import script1\""}}]}}
+{"type":"message","message":{"role":"toolResult","toolCallId":"b2","toolName":"bash","isError":false,"content":[{"type":"text","text":"Done"}]}}
+{"type":"message","message":{"role":"user","content":"Why didn't you follow the instructions in AGENTS.md?"}}

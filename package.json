@@ -1,0 +1,35 @@
+{
+  "name": "pi-harness2",
+  "version": "0.2.0",
+  "description": "Self-improving local workspace extension for Pi Coding Agent inspired by Google Research's Harness2",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "test": "node scripts/run-tests.mjs"
+  },
+  "keywords": [
+    "pi-coding-agent",
+    "pi-extension",
+    "harness2",
+    "self-improving-agent",
+    "skills",
+    "subagents"
+  ],
+  "license": "Apache-2.0",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "@sinclair/typebox": {
+      "optional": true
+    }
+  }
+}

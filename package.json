@@ -5,7 +5,8 @@
   "type": "module",
   "main": "./index.ts",
   "scripts": {
-    "test": "node scripts/run-tests.mjs"
+    "test": "node scripts/run-tests.mjs",
+    "test:smoke": "node scripts/run-tests.mjs --smoke"
   },
   "keywords": [
     "pi-package",

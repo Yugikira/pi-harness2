@@ -244,6 +244,45 @@ fs.writeFileSync(
   "utf-8"
 );
 
+if (process.argv.includes("--smoke")) {
+  const smokeScript = `
+import { loadSessionJsonlFile, buildSessionDigest } from "./src/analyzer.js";
+import { buildRecordFromMechanicalFacts } from "./src/recorder.js";
+import { createInitialWorkspaceState, applyTaskRecordToState, evaluateTriggers } from "./src/triggers.js";
+import { formatWorkspaceStatus } from "./src/ui.js";
+import { DEFAULT_HARNESS2_CONFIG } from "./src/config.js";
+
+const fixturePath = "./test/fixtures/real-sessions-sample.jsonl";
+const entries = loadSessionJsonlFile(fixturePath);
+const digest = buildSessionDigest(entries);
+const record = buildRecordFromMechanicalFacts(digest, DEFAULT_HARNESS2_CONFIG);
+const state = createInitialWorkspaceState();
+applyTaskRecordToState(state, record, entries.length);
+const trig = evaluateTriggers(state, DEFAULT_HARNESS2_CONFIG);
+
+console.log("=== PI-HARNESS2 SMOKE TEST ===");
+console.log("✓ Stage 1 Digest: " + digest.totalEntriesAnalyzed + " entries, transcript: " + digest.serializedTranscript.length + " chars");
+console.log("  • Root scripts created:", digest.mechanicalFacts.rootScriptsCreated);
+console.log("  • Failed tool calls:", digest.mechanicalFacts.failedToolCalls.length);
+console.log("✓ Stage 2 Recorder (" + record.recordedBy + "): recordId=" + record.recordId);
+console.log("  • Steering events:", record.summary.userSteeringCount);
+console.log("  • Instruction questions:", record.summary.instructionComplianceQuestionCount);
+console.log("  • Inefficiency score added: +" + record.summary.inefficiencyScoreAdded);
+console.log("  • Inefficiency fingerprints:", record.inefficiencyEvents.map(e => e.fingerprint));
+console.log("✓ Stage 3 Triggers:");
+console.log("  • Should propose?", trig.shouldPropose);
+console.log("  • Reasons:", trig.humanReadableReasons.join("; ") || "none");
+console.log("\\n" + formatWorkspaceStatus(process.cwd(), state, DEFAULT_HARNESS2_CONFIG));
+`;
+  fs.writeFileSync(path.join(tmpBuildDir, "smoke.js"), smokeScript);
+  const res = spawnSync(process.execPath, [path.join(tmpBuildDir, "smoke.js")], {
+    stdio: "inherit",
+    cwd: rootDir,
+  });
+  fs.rmSync(tmpBuildDir, { recursive: true, force: true });
+  process.exit(res.status ?? 0);
+}
+
 const testFile = path.join(tmpBuildDir, "test", "harness2.test.js");
 const res = spawnSync(process.execPath, ["--test", testFile], {
   stdio: "inherit",

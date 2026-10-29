@@ -57,7 +57,8 @@ export async function handleRecordAndCheck(
   ctx: PiCommandContext,
   userNote?: string,
   isAutoHook = false,
-  eventBranchEntries?: PiSessionEntry[]
+  eventBranchEntries?: PiSessionEntry[],
+  skipReview = false
 ): Promise<void> {
   const workspaceDir = ctx.cwd ?? process.cwd();
   const config = loadHarness2Config(workspaceDir);
@@ -100,15 +101,34 @@ export async function handleRecordAndCheck(
       : "";
 
   if (!isAutoHook) {
-    ctx.ui.notify(
-      `Recorded task via ${record.recordedBy} (${record.recordId})${restoredNote}: +${record.summary.userSteeringCount} steering, +${record.summary.inefficiencyScoreAdded} inefficiency score, +${record.summary.subagentRevisionCount} subagent revisions.`,
-      "info"
-    );
+    if (
+      record.summary.totalEntriesAnalyzed === 0 &&
+      record.summary.userSteeringCount === 0 &&
+      record.summary.inefficiencyScoreAdded === 0
+    ) {
+      ctx.ui.notify(
+        `No new task friction in current session (${sessionId}). Workspace friction counters: ${state.counters.cumulativeUserSteering}/${config.thresholds.userSteeringCount} steering, ${state.counters.cumulativeInefficiencyScore}/${config.thresholds.inefficiencyScore} inefficiency. Run \`/harness2 propose\` to force a proposal or \`/harness2 status\` for details.`,
+        "info"
+      );
+    } else {
+      ctx.ui.notify(
+        `Recorded task via ${record.recordedBy} (${record.recordId})${restoredNote}: +${record.summary.userSteeringCount} steering, +${record.summary.inefficiencyScoreAdded} inefficiency score, +${record.summary.subagentRevisionCount} subagent revisions.`,
+        "info"
+      );
+    }
+  }
+
+  if (skipReview) {
+    return;
   }
 
   const triggerEval = evaluateTriggers(state, config, false);
   if (triggerEval.shouldPropose) {
-    const recentRecords = loadRecentTaskRecords(workspaceDir, 5);
+    const recentRecords = loadRecentTaskRecords(
+      workspaceDir,
+      10,
+      state.lastProposalAppliedAt
+    );
     const proposal = await generateHarnessProposal(
       workspaceDir,
       recentRecords.length > 0 ? recentRecords : [record],
@@ -149,7 +169,11 @@ export async function handleHarness2Command(
 
   if (subcommand === "propose") {
     const state = loadWorkspaceState(workspaceDir);
-    let recentRecords = loadRecentTaskRecords(workspaceDir, 5);
+    let recentRecords = loadRecentTaskRecords(
+      workspaceDir,
+      10,
+      state.lastProposalAppliedAt
+    );
     if (recentRecords.length === 0) {
       const entries = resolveFullUncompactedEntries(ctx);
       if (entries.length > 0) {
@@ -165,6 +189,13 @@ export async function handleHarness2Command(
         saveTaskRecord(workspaceDir, adHocRecord);
         recentRecords = [adHocRecord];
       }
+    }
+    if (recentRecords.length === 0) {
+      ctx.ui.notify(
+        "No task records found in `.pi/harness2/records/` to propose improvements from. Use Pi to work on tasks first, then run `/harness2` or `/harness2 propose`.",
+        "warning"
+      );
+      return;
     }
     const triggerEval = evaluateTriggers(state, config, true);
     const proposal = await generateHarnessProposal(
@@ -244,11 +275,55 @@ export default function registerHarness2Extension(pi: PiExtensionAPI): void {
   // 2. Unified Session-End Recording Hook (`session_shutdown`):
   // Because `resolveFullUncompactedEntries` reads `ctx.sessionManager.getBranch()` or the raw `.jsonl` file,
   // all pre- and post-compaction messages since the last cursor are restored and recorded at session end.
+  // Note: skipReview is set to true so that no interactive TUI is launched while Pi is exiting.
   pi.on("session_shutdown", async (_event: unknown, ctx: PiCommandContext) => {
     const workspaceDir = ctx?.cwd ?? process.cwd();
     const config = loadHarness2Config(workspaceDir);
     if (config.recordMode === "auto") {
-      await handleRecordAndCheck(ctx, undefined, true);
+      await handleRecordAndCheck(ctx, undefined, true, undefined, true);
+    }
+  });
+
+  // 3. Next-Session Proposal Prompt Hook (`session_start`):
+  // When starting a new session in auto mode, check if accumulated friction crossed any threshold.
+  // If so, prompts the user to review now or snooze for 1 session.
+  pi.on("session_start", async (_event: unknown, ctx: PiCommandContext) => {
+    const workspaceDir = ctx?.cwd ?? process.cwd();
+    const config = loadHarness2Config(workspaceDir);
+    if (config.recordMode !== "auto") return;
+
+    const state = loadWorkspaceState(workspaceDir);
+    const triggerEval = evaluateTriggers(state, config, false);
+    if (!triggerEval.shouldPropose) return;
+
+    const choice = await ctx.ui.select(
+      `Harness² detected recurring workspace friction (${triggerEval.humanReadableReasons.join("; ")}). Review improvement proposal now?`,
+      [
+        "1. Review improvement proposal now",
+        "2. Not now (snooze for 1 session)",
+      ]
+    );
+
+    if (choice === "1. Review improvement proposal now" || choice?.startsWith("1.")) {
+      const recentRecords = loadRecentTaskRecords(
+        workspaceDir,
+        10,
+        state.lastProposalAppliedAt
+      );
+      const proposal = await generateHarnessProposal(
+        workspaceDir,
+        recentRecords,
+        triggerEval,
+        state,
+        config,
+        ctx
+      );
+      await runGuidedProposalReview(workspaceDir, proposal, state, ctx);
+    } else {
+      state.snoozeUntilSessionCount =
+        state.counters.sessionsSinceLastProposal + 1;
+      saveWorkspaceState(workspaceDir, state);
+      ctx.ui.notify("Harness² proposal snoozed for 1 session.", "info");
     }
   });
 }

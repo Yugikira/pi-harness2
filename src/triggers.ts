@@ -50,6 +50,7 @@ export function loadWorkspaceState(workspaceDir: string): WorkspaceHarnessState 
     return {
       ...createInitialWorkspaceState(),
       ...parsed,
+      lastProposalAppliedAt: parsed.lastProposalAppliedAt,
       counters: {
         ...createInitialWorkspaceState().counters,
         ...(parsed.counters ?? {}),
@@ -86,25 +87,49 @@ export function saveTaskRecord(workspaceDir: string, record: TaskRecord): string
 
 export function loadRecentTaskRecords(
   workspaceDir: string,
-  limit = 10
+  limit = 10,
+  sinceTimestamp?: string
 ): TaskRecord[] {
   const recordsDir = getRecordsDir(workspaceDir);
   if (!fs.existsSync(recordsDir)) return [];
   const files = fs
     .readdirSync(recordsDir)
-    .filter((f: string) => f.endsWith(".json"))
-    .sort()
-    .slice(-limit);
-  const records: TaskRecord[] = [];
-  for (const f of files) {
+    .filter((f) => f.endsWith(".json"))
+    .sort();
+  let records: TaskRecord[] = [];
+  for (const f of files.slice(-Math.max(limit * 2, 20))) {
     try {
       const raw = fs.readFileSync(path.join(recordsDir, f), "utf-8");
-      records.push(JSON.parse(raw) as TaskRecord);
+      records.push(JSON.parse(raw));
     } catch {
       // Ignore corrupted record file
     }
   }
-  return records;
+
+  // Filter to current cycle if sinceTimestamp is provided
+  if (sinceTimestamp) {
+    const cycleRecords = records.filter(
+      (r) => r.timestamp && r.timestamp > sinceTimestamp
+    );
+    if (cycleRecords.length > 0) {
+      records = cycleRecords;
+    }
+  }
+
+  // Prioritize records that actually contain friction events
+  const withEvents = records.filter(
+    (r) =>
+      r.summary.userSteeringCount > 0 ||
+      r.summary.inefficiencyScoreAdded > 0 ||
+      r.summary.subagentRevisionCount > 0 ||
+      (r.steeringEvents && r.steeringEvents.length > 0) ||
+      (r.inefficiencyEvents && r.inefficiencyEvents.length > 0) ||
+      (r.subagentEvents && r.subagentEvents.length > 0)
+  );
+  if (withEvents.length > 0) {
+    return withEvents.slice(-limit);
+  }
+  return records.slice(-limit);
 }
 
 /**
@@ -255,5 +280,6 @@ export function resetStateCounters(
     fingerprintCounts: {},
   };
   state.snoozeUntilSessionCount = 0;
+  state.lastProposalAppliedAt = new Date().toISOString();
   return state;
 }

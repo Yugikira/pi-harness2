@@ -172,6 +172,8 @@ export interface TaskRecord {
 export interface WorkspaceHarnessState {
   schemaVersion: 1;
   lastUpdated: string;
+  /** ISO timestamp of the last applied, dismissed, or reset proposal, defining the boundary of the current friction cycle */
+  lastProposalAppliedAt?: string;
   /** Map of sessionId -> last analyzed raw entry index for idempotent incremental recording */
   sessionCursors: Record<string, number>;
   counters: {

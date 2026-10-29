@@ -83,10 +83,142 @@ export function buildReflectionPrompt(
       2
     ),
     "",
-    "Return ONLY a valid JSON object matching the `HarnessProposal` interface (`diagnosisSummary`, `experienceEntry`, `fileOperations`).",
+    "### Output Format",
+    "Return ONLY a valid JSON object matching this exact schema:",
+    "```json",
+    JSON.stringify(
+      {
+        diagnosisSummary: "Concise summary of why this improvement is proposed",
+        experienceEntry: {
+          situation: "Context of what triggered this proposal",
+          evidenceQuotes: [
+            "Exact quote or description of observed friction 1",
+            "Exact quote or description of observed friction 2",
+          ],
+          lessonLearned: "Clear guideline or lesson to prevent future recurrence",
+        },
+        fileOperations: [
+          {
+            targetPath: `${skillsBaseDir}/example-skill/SKILL.md`,
+            operation: "create",
+            componentType: "skill",
+            rationale: "Why this file is created or updated",
+            fullNewContent: "---\nname: example-skill\ndescription: ...\n---\n...",
+          },
+        ],
+      },
+      null,
+      2
+    ),
+    "```",
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+/**
+ * Normalizes and validates an LLM-generated or partial proposal object,
+ * ensuring all required fields (especially experienceEntry.evidenceQuotes)
+ * are present, well-formed, and safely populated with fallbacks from recorded task evidence.
+ */
+export function normalizeHarnessProposal(
+  raw: Partial<HarnessProposal> | Record<string, unknown> | null | undefined,
+  records: TaskRecord[],
+  triggerResult: TriggerEvaluationResult,
+  modelUsed: string
+): HarnessProposal | null {
+  if (!raw || typeof raw !== "object") return null;
+
+  const rawOps = Array.isArray(raw.fileOperations) ? raw.fileOperations : [];
+  if (rawOps.length === 0) return null;
+
+  const fileOperations: ProposedFileOperation[] = [];
+  for (const op of rawOps) {
+    if (
+      op &&
+      typeof op.targetPath === "string" &&
+      op.targetPath.trim() &&
+      typeof op.fullNewContent === "string" &&
+      op.fullNewContent.trim()
+    ) {
+      fileOperations.push({
+        targetPath: op.targetPath.trim().replace(/\\/g, "/"),
+        operation: op.operation === "update" ? "update" : "create",
+        componentType: op.componentType || "skill",
+        rationale: op.rationale || "Workspace improvement based on recorded evidence.",
+        fullNewContent: op.fullNewContent,
+      });
+    }
+  }
+
+  if (fileOperations.length === 0) return null;
+
+  // Extract fallback evidence quotes from records in case LLM omitted them
+  const fallbackQuotes: string[] = [];
+  for (const r of records) {
+    for (const s of r.steeringEvents || []) {
+      if (s.userMessageQuote) {
+        fallbackQuotes.push(`User (${s.eventType}): "${s.userMessageQuote.slice(0, 140)}"`);
+      }
+    }
+    for (const ineff of r.inefficiencyEvents || []) {
+      if (ineff.description) {
+        fallbackQuotes.push(ineff.description);
+      }
+    }
+    for (const sub of r.subagentEvents || []) {
+      fallbackQuotes.push(`Subagent '${sub.subagentName}': ${sub.outcomeSignal}`);
+    }
+  }
+
+  const rawExp = raw.experienceEntry;
+  let situation = triggerResult.humanReadableReasons.join("; ") || "Workspace friction threshold met.";
+  let evidenceQuotes: string[] = fallbackQuotes.slice(0, 6);
+  let lessonLearned =
+    (typeof raw.diagnosisSummary === "string" && raw.diagnosisSummary.trim()) ||
+    "Codified user corrections and tool workflow improvements into workspace configuration.";
+
+  if (rawExp && typeof rawExp === "object") {
+    const objExp = rawExp;
+    if (typeof objExp.situation === "string" && objExp.situation.trim()) {
+      situation = objExp.situation.trim();
+    }
+    if (Array.isArray(objExp.evidenceQuotes) && objExp.evidenceQuotes.length > 0) {
+      evidenceQuotes = objExp.evidenceQuotes
+        .map((q) => (typeof q === "string" ? q.trim() : String(q)))
+        .filter(Boolean);
+    }
+    if (typeof objExp.lessonLearned === "string" && objExp.lessonLearned.trim()) {
+      lessonLearned = objExp.lessonLearned.trim();
+    }
+  } else if (typeof rawExp === "string" && rawExp.trim()) {
+    lessonLearned = rawExp.trim();
+  }
+
+  const diagnosisSummary =
+    typeof raw.diagnosisSummary === "string" && raw.diagnosisSummary.trim()
+      ? raw.diagnosisSummary.trim()
+      : `Triggered by: ${situation}`;
+
+  return {
+    proposalId:
+      typeof raw.proposalId === "string" && raw.proposalId.trim()
+        ? raw.proposalId.trim()
+        : `prop-${Date.now()}`,
+    createdAt:
+      typeof raw.createdAt === "string" && raw.createdAt.trim()
+        ? raw.createdAt.trim()
+        : new Date().toISOString(),
+    modelUsed,
+    triggerReasons: triggerResult.reasons,
+    diagnosisSummary,
+    experienceEntry: {
+      situation,
+      evidenceQuotes,
+      lessonLearned,
+    },
+    fileOperations,
+  };
 }
 
 /**
@@ -122,19 +254,14 @@ export async function generateHarnessProposal(
       const jsonMatch = candidate.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]) as HarnessProposal;
-        if (
-          parsed &&
-          Array.isArray(parsed.fileOperations) &&
-          parsed.fileOperations.length > 0 &&
-          parsed.diagnosisSummary
-        ) {
-          return {
-            ...parsed,
-            proposalId: parsed.proposalId || `prop-${Date.now()}`,
-            createdAt: new Date().toISOString(),
-            modelUsed: llmResult.modelUsed,
-            triggerReasons: triggerResult.reasons,
-          };
+        const normalized = normalizeHarnessProposal(
+          parsed,
+          records,
+          triggerResult,
+          llmResult.modelUsed
+        );
+        if (normalized) {
+          return normalized;
         }
       }
     }

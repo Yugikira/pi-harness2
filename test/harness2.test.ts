@@ -29,16 +29,25 @@ import {
 } from "../src/triggers.js";
 import {
   UnauthorizedTargetPathError,
+  appendExperienceEntry,
   applyHarnessProposal,
   undoLatestProposal,
   validateTargetPath,
 } from "../src/applier.js";
-import { generateHarnessProposal } from "../src/improver.js";
+import {
+  generateHarnessProposal,
+  normalizeHarnessProposal,
+} from "../src/improver.js";
 import {
   MENU_OPTION_APPLY,
   MENU_OPTION_DISMISS,
   MENU_OPTION_PREVIEW,
+  formatProposalCard,
 } from "../src/ui.js";
+import {
+  loadRecentTaskRecords,
+  saveTaskRecord,
+} from "../src/triggers.js";
 import registerHarness2Extension from "../src/index.js";
 import type {
   HarnessProposal,
@@ -889,5 +898,377 @@ describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CM
     assert.equal(r2.recordedBy, "llm_judge");
     assert.equal(r1.summary.inefficiencyScoreAdded, 4);
     assert.equal(r2.summary.inefficiencyScoreAdded, 3);
+  });
+});
+
+describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup Hook", () => {
+  it("UT-NORM-01: normalizes LLM proposal missing experienceEntry or evidenceQuotes without throwing", () => {
+    const rawProposalWithoutExp = {
+      diagnosisSummary: "Standardize literature queries into reusable skill",
+      fileOperations: [
+        {
+          targetPath: ".pi/skills/literature-search/SKILL.md",
+          operation: "create",
+          componentType: "skill",
+          rationale: "Replaces temporary scripts with reusable skill",
+          fullNewContent: "# Literature Search Skill",
+        },
+      ],
+    };
+
+    const triggerResult = {
+      shouldPropose: true,
+      reasons: ["TOOL_INEFFICIENCY_SCORE_THRESHOLD"],
+      humanReadableReasons: ["Accumulated tool inefficiency score of 3."],
+    };
+
+    const mockRecords = [
+      {
+        recordId: "rec-1",
+        sessionId: "sess-1",
+        timestamp: new Date().toISOString(),
+        workspacePath: "/mock/ws",
+        recordedBy: "llm_judge",
+        summary: {
+          totalEntriesAnalyzed: 5,
+          totalToolCalls: 3,
+          userSteeringCount: 1,
+          instructionComplianceQuestionCount: 0,
+          hasInstructionComplianceQuestion: false,
+          inefficiencyEventCount: 1,
+          inefficiencyScoreAdded: 3,
+          subagentRevisionCount: 0,
+          networkRetriesIgnored: 0,
+        },
+        steeringEvents: [
+          {
+            entryIndex: 2,
+            eventType: "corrective_steer",
+            userMessageQuote: "Do not create scripts in the root directory!",
+            precedingAssistantActionSummary: "bash(python search.py)",
+          },
+        ],
+        inefficiencyEvents: [
+          {
+            turnRange: [1, 4],
+            classification: "temp_script_sprawl",
+            scoreWeight: 3,
+            fingerprint: "temp_script_sprawl",
+            toolsInvoked: [],
+            description: "Created 3 ad-hoc Python scripts in root.",
+          },
+        ],
+        subagentEvents: [],
+      },
+    ];
+
+    const normalized = normalizeHarnessProposal(
+      rawProposalWithoutExp,
+      mockRecords,
+      triggerResult,
+      "google/gemini-2.5-flash"
+    );
+
+    assert.ok(normalized);
+    assert.equal(normalized.modelUsed, "google/gemini-2.5-flash");
+    assert.ok(normalized.experienceEntry);
+    assert.ok(Array.isArray(normalized.experienceEntry.evidenceQuotes));
+    assert.ok(normalized.experienceEntry.evidenceQuotes.length > 0);
+    assert.ok(
+      normalized.experienceEntry.evidenceQuotes.some(
+        (q) => q.includes("temp_script_sprawl") || q.includes("root directory")
+      )
+    );
+    assert.equal(normalized.fileOperations.length, 1);
+
+    // Verify formatProposalCard renders safely without throwing undefined is not an object
+    const cardText = formatProposalCard(normalized);
+    assert.ok(cardText.includes("Proposal ID:"));
+    assert.ok(cardText.includes("Observed Evidence:"));
+
+    // Verify raw malformed proposal also does not crash formatProposalCard
+    const rawPartialProposal = {
+      proposalId: "prop-raw-test",
+      createdAt: new Date().toISOString(),
+      modelUsed: "test-model",
+      triggerReasons: ["MANUAL_FORCE_PROPOSE"],
+      diagnosisSummary: "Raw partial test",
+      fileOperations: [],
+    };
+    const safeCard = formatProposalCard(rawPartialProposal);
+    assert.ok(safeCard.includes("prop-raw-test"));
+
+    const ws = makeTempDir("ws-exp-test");
+    // Verify appendExperienceEntry also executes without throwing
+    appendExperienceEntry(ws, normalized, "APPLIED");
+    const expContent = fs.readFileSync(
+      path.join(ws, ".pi", "harness2", "EXPERIENCE.md"),
+      "utf-8"
+    );
+    assert.ok(expContent.includes("[APPLIED]"));
+  });
+
+  it("UT-NORM-02: loadRecentTaskRecords prioritizes friction records over empty session records", () => {
+    const ws = makeTempDir("ws-prioritize-records");
+
+    // Save 2 records with real friction
+    for (let i = 1; i <= 2; i++) {
+      saveTaskRecord(ws, {
+        recordId: `rec-friction-${i}`,
+        sessionId: `sess-${i}`,
+        timestamp: `2026-10-29T10:0${i}:00.000Z`,
+        workspacePath: ws,
+        recordedBy: "llm_judge",
+        summary: {
+          totalEntriesAnalyzed: 10,
+          totalToolCalls: 5,
+          userSteeringCount: 1,
+          instructionComplianceQuestionCount: 0,
+          hasInstructionComplianceQuestion: false,
+          inefficiencyEventCount: 1,
+          inefficiencyScoreAdded: 1,
+          subagentRevisionCount: 0,
+          networkRetriesIgnored: 0,
+        },
+        steeringEvents: [
+          {
+            entryIndex: 1,
+            eventType: "corrective_steer",
+            userMessageQuote: `Steering quote ${i}`,
+            precedingAssistantActionSummary: "action",
+          },
+        ],
+        inefficiencyEvents: [
+          {
+            turnRange: [1, 2],
+            classification: "single_retry_recovery",
+            scoreWeight: 1,
+            fingerprint: "python_encoding",
+            toolsInvoked: [],
+            description: `Tool error ${i}`,
+          },
+        ],
+        subagentEvents: [],
+      });
+    }
+
+    // Now save 5 empty session records (e.g. user started Pi and quit without doing anything)
+    for (let i = 3; i <= 7; i++) {
+      saveTaskRecord(ws, {
+        recordId: `rec-empty-${i}`,
+        sessionId: `sess-${i}`,
+        timestamp: `2026-10-29T11:0${i}:00.000Z`,
+        workspacePath: ws,
+        recordedBy: "mechanical_fallback",
+        summary: {
+          totalEntriesAnalyzed: 1,
+          totalToolCalls: 0,
+          userSteeringCount: 0,
+          instructionComplianceQuestionCount: 0,
+          hasInstructionComplianceQuestion: false,
+          inefficiencyEventCount: 0,
+          inefficiencyScoreAdded: 0,
+          subagentRevisionCount: 0,
+          networkRetriesIgnored: 0,
+        },
+        steeringEvents: [],
+        inefficiencyEvents: [],
+        subagentEvents: [],
+      });
+    }
+
+    const loaded = loadRecentTaskRecords(ws, 5);
+    // Should prioritize the friction-containing records
+    assert.ok(loaded.some((r) => r.recordId.startsWith("rec-friction-")));
+    assert.ok(loaded.some((r) => r.steeringEvents.length > 0));
+  });
+
+  it("IT-AUTO-02: next-session startup prompts user when prior threshold met and handles review/snooze", async () => {
+    const ws = makeTempDir("ws-session-start");
+    fs.mkdirSync(path.join(ws, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(ws, ".pi", "settings.json"),
+      JSON.stringify({ harness2: { recordMode: "auto" } }),
+      "utf-8"
+    );
+
+    // Seed state with friction crossing instruction violation threshold
+    const state = createInitialWorkspaceState();
+    state.counters.cumulativeInstructionQuestions = 1;
+    saveWorkspaceState(ws, state);
+
+    // Save a real task record with instruction audit
+    saveTaskRecord(ws, {
+      recordId: "rec-prior-1",
+      sessionId: "sess-prior",
+      timestamp: new Date().toISOString(),
+      workspacePath: ws,
+      recordedBy: "llm_judge",
+      summary: {
+        totalEntriesAnalyzed: 5,
+        totalToolCalls: 2,
+        userSteeringCount: 0,
+        instructionComplianceQuestionCount: 1,
+        hasInstructionComplianceQuestion: true,
+        inefficiencyEventCount: 0,
+        inefficiencyScoreAdded: 0,
+        subagentRevisionCount: 0,
+        networkRetriesIgnored: 0,
+      },
+      steeringEvents: [
+        {
+          entryIndex: 1,
+          eventType: "instruction_compliance_question",
+          userMessageQuote: "Why did you ignore the rule in AGENTS.md?",
+          precedingAssistantActionSummary: "rm -rf data",
+        },
+      ],
+      inefficiencyEvents: [],
+      subagentEvents: [],
+    });
+
+    const hooks = new Map();
+    const mockPi = {
+      registerCommand() {},
+      on(ev, handler) {
+        hooks.set(ev, handler);
+      },
+    };
+    registerHarness2Extension(mockPi);
+
+    // Scenario 1: User starts session and selects "Not now (snooze for 1 session)"
+    let selectPromptText = "";
+    const ctxSnooze = {
+      cwd: ws,
+      sessionId: "sess-new-1",
+      ui: {
+        notify() {},
+        async select(prompt, options) {
+          selectPromptText = prompt;
+          return "2. Not now (snooze for 1 session)";
+        },
+        async confirm() {
+          return true;
+        },
+      },
+    };
+
+    const sessionStartHook = hooks.get("session_start");
+    assert.ok(sessionStartHook);
+
+    await sessionStartHook({}, ctxSnooze);
+    assert.ok(selectPromptText.includes("Harness² detected recurring workspace friction"));
+    const snoozedState = loadWorkspaceState(ws);
+    assert.equal(snoozedState.snoozeUntilSessionCount, 1);
+
+    // Scenario 2: User starts session and selects "1. Review improvement proposal now"
+    // Reset snooze count for test
+    snoozedState.snoozeUntilSessionCount = 0;
+    saveWorkspaceState(ws, snoozedState);
+
+    let proposalReviewed = false;
+    const ctxReview = {
+      cwd: ws,
+      sessionId: "sess-new-2",
+      ui: {
+        notify() {},
+        async select(prompt, options) {
+          if (prompt.includes("Review improvement proposal now")) {
+            return "1. Review improvement proposal now";
+          }
+          if (prompt.includes("Choose an action")) {
+            proposalReviewed = true;
+            return MENU_OPTION_DISMISS;
+          }
+          return undefined;
+        },
+        async confirm() {
+          return true;
+        },
+      },
+    };
+
+    await sessionStartHook({}, ctxReview);
+    assert.equal(proposalReviewed, true);
+  });
+
+  it("UT-NORM-03: loadRecentTaskRecords scopes to current cycle when sinceTimestamp / lastProposalAppliedAt is set", () => {
+    const ws = makeTempDir("ws-cycle-boundary");
+
+    // Old cycle: record created at 10:00
+    saveTaskRecord(ws, {
+      recordId: "rec-old-1",
+      sessionId: "sess-old-1",
+      timestamp: "2026-10-29T10:00:00.000Z",
+      workspacePath: ws,
+      recordedBy: "llm_judge",
+      summary: {
+        totalEntriesAnalyzed: 5,
+        totalToolCalls: 2,
+        userSteeringCount: 1,
+        instructionComplianceQuestionCount: 0,
+        hasInstructionComplianceQuestion: false,
+        inefficiencyEventCount: 0,
+        inefficiencyScoreAdded: 0,
+        subagentRevisionCount: 0,
+        networkRetriesIgnored: 0,
+      },
+      steeringEvents: [
+        {
+          entryIndex: 1,
+          eventType: "corrective_steer",
+          userMessageQuote: "Old issue that was already solved",
+          precedingAssistantActionSummary: "action",
+        },
+      ],
+      inefficiencyEvents: [],
+      subagentEvents: [],
+    });
+
+    // Proposal was applied at 10:10
+    const proposalAppliedAt = "2026-10-29T10:10:00.000Z";
+
+    // New cycle: record created at 10:20
+    saveTaskRecord(ws, {
+      recordId: "rec-new-1",
+      sessionId: "sess-new-1",
+      timestamp: "2026-10-29T10:20:00.000Z",
+      workspacePath: ws,
+      recordedBy: "llm_judge",
+      summary: {
+        totalEntriesAnalyzed: 5,
+        totalToolCalls: 2,
+        userSteeringCount: 0,
+        instructionComplianceQuestionCount: 1,
+        hasInstructionComplianceQuestion: true,
+        inefficiencyEventCount: 0,
+        inefficiencyScoreAdded: 0,
+        subagentRevisionCount: 0,
+        networkRetriesIgnored: 0,
+      },
+      steeringEvents: [
+        {
+          entryIndex: 1,
+          eventType: "instruction_compliance_question",
+          userMessageQuote: "Brand new issue in new cycle",
+          precedingAssistantActionSummary: "action",
+        },
+      ],
+      inefficiencyEvents: [],
+      subagentEvents: [],
+    });
+
+    // Without cycle boundary: returns both
+    const allRecords = loadRecentTaskRecords(ws, 10);
+    assert.equal(allRecords.length, 2);
+
+    // With cycle boundary: only returns new cycle records after 10:10
+    const currentCycleRecords = loadRecentTaskRecords(ws, 10, proposalAppliedAt);
+    assert.equal(currentCycleRecords.length, 1);
+    assert.equal(currentCycleRecords[0].recordId, "rec-new-1");
+    assert.equal(
+      currentCycleRecords[0].steeringEvents[0].userMessageQuote,
+      "Brand new issue in new cycle"
+    );
   });
 });

@@ -171,14 +171,31 @@ export function appendExperienceEntry(
     ? fs.readFileSync(expPath, "utf-8")
     : "# Harness² Workspace Experience Library (`EXPERIENCE.md`)\n\n";
 
+  const situation =
+    proposal.experienceEntry?.situation ||
+    proposal.diagnosisSummary ||
+    "Workspace friction threshold met";
+  const evidenceQuotes = Array.isArray(proposal.experienceEntry?.evidenceQuotes)
+    ? proposal.experienceEntry.evidenceQuotes
+    : [];
+  const lessonLearned =
+    proposal.experienceEntry?.lessonLearned ||
+    proposal.diagnosisSummary ||
+    "Codified improvements into workspace configuration.";
+  const fileOperations = Array.isArray(proposal.fileOperations)
+    ? proposal.fileOperations
+    : [];
+
   const entryBlock = [
     `## [${status}] ${proposal.createdAt} (${proposal.proposalId})`,
     `- **Triggers:** ${proposal.triggerReasons.join(", ")}`,
-    `- **Situation:** ${proposal.experienceEntry.situation}`,
+    `- **Situation:** ${situation}`,
     `- **Evidence:**`,
-    ...proposal.experienceEntry.evidenceQuotes.map((q) => `  - ${q}`),
-    `- **Lesson Learned:** ${proposal.experienceEntry.lessonLearned}`,
-    `- **Files Targeted:** ${proposal.fileOperations.map((f) => `\`${f.targetPath}\``).join(", ")}`,
+    ...(evidenceQuotes.length > 0
+      ? evidenceQuotes.map((q) => `  - ${q}`)
+      : ["  - (Extracted from recorded task evidence)"]),
+    `- **Lesson Learned:** ${lessonLearned}`,
+    `- **Files Targeted:** ${fileOperations.map((f) => `\`${f.targetPath}\``).join(", ")}`,
     "",
   ].join("\n");
 

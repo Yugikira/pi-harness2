@@ -22,17 +22,30 @@ export const MENU_OPTION_SNOOZE = "4. Snooze for 1 Session";
  * Formats a concise, plain-English Proposal Card for the terminal.
  */
 export function formatProposalCard(proposal: HarnessProposal): string {
+  const situation =
+    proposal.experienceEntry?.situation ||
+    proposal.diagnosisSummary ||
+    "Workspace friction threshold met";
+  const evidenceQuotes = Array.isArray(proposal.experienceEntry?.evidenceQuotes)
+    ? proposal.experienceEntry.evidenceQuotes
+    : [];
+  const fileOperations = Array.isArray(proposal.fileOperations)
+    ? proposal.fileOperations
+    : [];
+
   const lines = [
     "╭─ Harness² Workspace Improvement Proposal ─────────────────────────╮",
     `  Proposal ID: ${proposal.proposalId} (Model: ${proposal.modelUsed})`,
-    `  Why this triggered: ${proposal.experienceEntry.situation}`,
+    `  Why this triggered: ${situation}`,
     "",
     "  Observed Evidence:",
-    ...proposal.experienceEntry.evidenceQuotes.map((q) => `    • ${q}`),
+    ...(evidenceQuotes.length > 0
+      ? evidenceQuotes.map((q) => `    • ${q}`)
+      : ["    • (Extracted from recent task friction events)"]),
     "",
     "  Proposed Workspace Modifications:",
-    ...proposal.fileOperations.map(
-      (op) => `    • [${op.operation.toUpperCase()}] ${op.targetPath} — ${op.rationale}`
+    ...fileOperations.map(
+      (op) => `    • [${(op.operation || "UPDATE").toUpperCase()}] ${op.targetPath} — ${op.rationale}`
     ),
     "╰───────────────────────────────────────────────────────────────────╯",
   ];

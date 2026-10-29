@@ -260,7 +260,7 @@ describe("2. Stage 1 — Uncompacted Session Digest & Mechanical Facts (UT-DIG)"
     assert.ok(!digest.serializedTranscript.includes("Very long internal reasoning"));
   });
 
-  it("UT-DIG-02: ignores context_edit retracted turns and provider stopReason=error duplicate user resends", () => {
+  it("UT-DIG-02: ignores context_edit retracted turns and provider stopReason=error duplicate user resends, while preserving intentional repetition", () => {
     const entries: PiSessionEntry[] = [
       {
         type: "message",
@@ -298,6 +298,40 @@ describe("2. Stage 1 — Uncompacted Session Digest & Mechanical Facts (UT-DIG)"
     assert.equal(digest.mechanicalFacts.networkRetriesIgnored, 1);
     const matches = digest.serializedTranscript.match(/Please fix slide 3 logical drift/g) ?? [];
     assert.equal(matches.length, 1);
+
+    // Verify intentional user repetitions without provider errors are preserved
+    const intentionalRepeatEntries: PiSessionEntry[] = [
+      {
+        type: "message",
+        id: "u1-normal",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Please fix slide 3 logical drift." }],
+        },
+      },
+      {
+        type: "message",
+        id: "a1-normal",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "I made some edits." }],
+        },
+      },
+      {
+        type: "message",
+        id: "u2-repeat",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Please fix slide 3 logical drift." }],
+        },
+      },
+    ];
+
+    const intentionalDigest = buildSessionDigest(intentionalRepeatEntries);
+    assert.equal(intentionalDigest.mechanicalFacts.networkRetriesIgnored, 0);
+    const repeatMatches =
+      intentionalDigest.serializedTranscript.match(/Please fix slide 3 logical drift/g) ?? [];
+    assert.equal(repeatMatches.length, 2);
   });
 
   it("UT-DIG-03: extracts mechanical facts for root script sprawl, failed tool calls, and subagent file revisions", () => {

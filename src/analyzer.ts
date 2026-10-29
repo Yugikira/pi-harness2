@@ -446,8 +446,7 @@ export function buildSessionDigest(
       }
 
       if (
-        (recentProviderErrorOrContextEdit ||
-          isNearDuplicateUserPrompt(userText, lastUserText)) &&
+        recentProviderErrorOrContextEdit &&
         isNearDuplicateUserPrompt(userText, lastUserText)
       ) {
         networkRetriesIgnored += 1;

@@ -1,521 +1,455 @@
 # Technical & Test Specification: `pi-harness2` Workspace Self-Improvement Extension
 
-- **Document Version:** 1.0  
-- **Date:** October 24, 2026  
+- **Document Version:** 0.3.0  
+- **Date:** October 28, 2026  
 - **Companion Document:** `pi-harness2-prd.md`  
 - **Host Runtime:** [@earendil-works/pi-coding-agent](https://github.com/earendil-works/pi) (`Node.js >= 22.19`, TypeScript Extension API)  
 - **Target Subagent System:** Forked [interactive-subagents](https://drive.google.com/drive/folders/1HWVPXDBd5c3LWr3-lY_HbHZptSXzIem-) ([README.md](https://drive.google.com/file/d/1sasZ6hOROTiGDIkQeprSkj1mds_ba26T/view?usp=drivesdk), [CHANGELOG.md](https://drive.google.com/file/d/1lAnHliH7iUpMbioREtz8oAoOVBqhQTU_/view?usp=drivesdk))  
 - **Reference Architecture:** [google-research/harness2](https://github.com/google-research/harness2) ([arXiv:2610.14224](https://arxiv.org/html/2610.14224v1))
 
-## 1\. System Architecture & Directory Layout
+---
+
+## 1. System Architecture & Directory Layout
 
 ### 1.1 Extension Package Layout
 
 `pi-harness2` can be installed globally (`~/.pi/agent/extensions/pi-harness2/`) or as a standard [Pi package](https://pi.dev/docs/latest/packages):
 
+```
 pi-harness2/
-
-├── package.json                  \# Peer dependencies: @earendil-works/pi-coding-agent, @earendil-works/pi-tui, @sinclair/typebox (all optional: true)
-
+├── package.json                  # Manifest & optional peerDependencies
 ├── tsconfig.json
-
+├── index.ts                      # Re-export entrypoint for Pi package loaders
+├── scripts/
+│   └── run-tests.mjs             # Zero-dependency test runner using node:test
 ├── src/
-
-│   ├── index.ts                  \# Extension entry point: export default function (pi: ExtensionAPI)
-
-│   ├── config.ts                 \# Merges \~/.pi/agent/settings.json and \<cwd\>/.pi/settings.json
-
-│   ├── analyzer.ts               \# Deterministic transcript analyzer (orchestrator session only)
-
-│   ├── triggers.ts               \# Evaluates the 4 trigger rules against workspace state
-
-│   ├── improver.ts               \# LLM reflection & proposal generator (Harness² Compose \+ Reflect)
-
-│   ├── applier.ts                \# Atomic file writer, backup manager, and /harness2 undo engine
-
-│   ├── ui.ts                     \# Guided TUI proposal cards, diff previewer, and ctx.ui menus
-
-│   └── types.ts                  \# TypeScript interfaces & TypeBox validation schemas
-
-└── test/
-
-    ├── unit/
-
-    │   ├── config.test.ts
-
-    │   ├── analyzer.test.ts
-
-    │   ├── triggers.test.ts
-
-    │   └── applier.test.ts
-
-    ├── integration/
-
-    │   ├── command-flow.test.ts
-
-    │   ├── auto-record.test.ts
-
-    │   └── subagent-inference.test.ts
-
-    └── fixtures/
-
-        ├── transcripts/          \# Recorded SessionEntry\[\] fixtures for each friction type
-
-        └── workspaces/           \# Mock workspace directories for apply/undo testing
+│   ├── index.ts                  # Extension entry point: register commands & lifecycle hooks
+│   ├── config.ts                 # Merges ~/.pi/agent/settings.json and <cwd>/.pi/settings.json
+│   ├── analyzer.ts               # Stage 1: Uncompacted branch restoration & deterministic SessionDigest builder
+│   ├── recorder.ts               # Stage 2: AI Model Semantic Recorder (callPiModel & mechanical fallback)
+│   ├── triggers.ts               # Evaluates trigger thresholds against accumulated WorkspaceHarnessState
+│   ├── improver.ts               # LLM reflection & proposal synthesis (Harness² Compose + Reflect)
+│   ├── applier.ts                # Atomic file writer, backup manager, and /harness2 undo engine
+│   ├── ui.ts                     # Guided TUI proposal cards, diff previewer, and ctx.ui menus
+│   └── types.ts                  # TypeScript interfaces matching Pi Extension API & schemas
+├── test/
+│   ├── fixtures/
+│   │   └── real-sessions-sample.jsonl # Sample real session transcript fixture
+│   └── harness2.test.ts          # Comprehensive unit & integration test suite (13 test cases)
+└── docs/
+    ├── pi-harness2-prd.md        # Product Requirements Document
+    └── pi-harness2-spec.md       # Technical & Test Specification (this document)
+```
 
 ### 1.2 Target Local Workspace State Layout
 
 Inside any user workspace (`<cwd>`), `pi-harness2` reads and writes to `.pi/harness2/` and modifies standard project-level Pi configuration files per the [Pi Configuration specification](https://pi.dev/docs/latest/configuration):
 
-\<workspace-root\>/
-
-├── AGENTS.md                                 \# Project instructions & subagent delegation rules (Editable by pi-harness2)
-
+```
+<workspace-root>/
+├── AGENTS.md                                 # Project instructions & subagent delegation rules (Editable by pi-harness2)
 └── .pi/
-
-    ├── settings.json                         \# Optional workspace-level overrides for harness2
-
-    ├── APPEND\_SYSTEM.md                      \# Optional system prompt additions (Editable by pi-harness2)
-
-    ├── skills/                               \# Workspace-specific skills (Created/Edited by pi-harness2)
-
-    │   └── \<skill-name\>/
-
+    ├── settings.json                         # Optional workspace-level overrides for harness2
+    ├── APPEND_SYSTEM.md                      # Optional system prompt additions (Editable by pi-harness2)
+    ├── skills/                               # Workspace-specific skills (Created/Edited by pi-harness2)
+    │   └── <skill-name>/
     │       ├── SKILL.md
-
     │       └── scripts/
-
-    ├── agents/                               \# Workspace-specific interactive-subagents profiles (Created/Edited by pi-harness2)
-
-    │   └── \<agent-name\>.md
-
-    ├── extensions/                           \# Workspace-specific guardrail extensions (Created/Edited by pi-harness2)
-
-    │   └── \<guardrail-name\>.ts
-
-    └── harness2/                             \# Internal state managed by pi-harness2
-
-        ├── state.json                        \# Cumulative counters, active thresholds, last recorded session ID
-
-        ├── EXPERIENCE.md                     \# Harness² persistent lesson log (human & LLM readable)
-
+    ├── agents/                               # Workspace-specific interactive-subagents profiles (Created/Edited by pi-harness2)
+    │   └── <agent-name>.md
+    ├── extensions/                           # Workspace-specific guardrail extensions (Created/Edited by pi-harness2)
+    │   └── <guardrail-name>.ts
+    └── harness2/                             # Internal state managed by pi-harness2
+        ├── state.json                        # Cumulative counters, active thresholds, per-session cursors
+        ├── EXPERIENCE.md                     # Harness² persistent lesson log (human & LLM readable)
         ├── records/
-
-        │   └── \<YYYYMMDD-HHMMSS\>-\<id\>.json   \# Structured TaskRecord snapshots
-
-        ├── proposals/
-
-        │   └── \<proposal-id\>.json            \# Generated proposals (applied, dismissed, or snoozed)
-
+        │   └── <YYYYMMDD-HHMMSS>_<recordId>.json # Structured TaskRecord snapshots
         └── backups/
-
-            └── \<ISO-timestamp\>-\<proposal-id\>/
-
-                ├── manifest.json             \# List of created vs. modified files and original hashes
-
-                └── files/                    \# Exact copies of modified files prior to apply
+            └── <ISO-timestamp>_<proposalId>/
+                ├── manifest.json             # List of created vs. modified files and prior counters
+                └── files/                    # Exact copies of modified files prior to apply
+```
 
 ### 1.3 Package Manifest Contract (`package.json`)
 
-Following the peer-dependency best practice established in your [interactive-subagents CHANGELOG v3.8.1](https://drive.google.com/file/d/1lAnHliH7iUpMbioREtz8oAoOVBqhQTU_/view?usp=drivesdk) and [Pi Packages docs](https://pi.dev/docs/latest/packages), host-provided packages must be marked `optional: true` in `peerDependenciesMeta` to prevent duplicate installation of the Pi runtime:
+Following the peer-dependency best practice established in [interactive-subagents CHANGELOG v3.8.1](https://drive.google.com/file/d/1lAnHliH7iUpMbioREtz8oAoOVBqhQTU_/view?usp=drivesdk) and [Pi Packages docs](https://pi.dev/docs/latest/packages), host-provided packages must be marked `optional: true` in `peerDependenciesMeta` to prevent duplicate installation of the Pi runtime:
 
+```json
 {
-
   "name": "pi-harness2",
-
-  "version": "0.1.0",
-
+  "version": "0.3.0",
   "type": "module",
-
-  "main": "./src/index.ts",
-
+  "main": "./index.ts",
   "peerDependencies": {
-
-    "@earendil-works/pi-coding-agent": "\*",
-
-    "@earendil-works/pi-tui": "\*",
-
-    "@sinclair/typebox": "\*"
-
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
-
   "peerDependenciesMeta": {
-
     "@earendil-works/pi-coding-agent": { "optional": true },
-
+    "@earendil-works/pi-ai": { "optional": true },
     "@earendil-works/pi-tui": { "optional": true },
-
-    "@sinclair/typebox": { "optional": true }
-
+    "typebox": { "optional": true }
   }
-
 }
+```
 
-## 2\. Data Models & Configuration Schemas
+---
+
+## 2. Data Models & Configuration Schemas
 
 ### 2.1 Configuration Schema (`settings.json`)
 
 `src/config.ts` resolves settings by reading `<agent-dir>/settings.json` (default `~/.pi/agent/settings.json` or `$PI_CODING_AGENT_DIR/settings.json`) and deep-merging `<cwd>/.pi/settings.json` on top:
 
-export interface Harness2Config {
-
-  /\*\*
-
-   \* "manual" (default): only records when user runs \`/harness2\` or \`/harness2 record\`.
-
-   \* "auto": passively records completed sessions on \`agent\_before\_settle\` / session exit.
-
-   \*/
-
-  recordMode: "manual" \| "auto";
-
-  /\*\*
-
-   \* Optional model ID for reflection and proposal synthesis (e.g. "anthropic/claude-opus-4-8").
-
-   \* Falls back to the active session model (\`ctx.model\`) when null/undefined.
-
-   \*/
-
-  model?: string \| null;
-
-  /\*\*
-
-   \* Trigger thresholds for the workspace.
-
-   \*/
-
-  thresholds: {
-
-    userSteeringCount: number;        // Default: 3
-
-    instructionViolationQuery: number;// Default: 1 (Immediate trigger)
-
-    inefficientToolChains: number;    // Default: 3
-
-    subagentRevisions: number;        // Default: 2
-
-  };
-
-  /\*\*
-
-   \* Minimum consecutive failed/exploratory tool calls on the same objective
-
-   \* required to classify a sequence as an "inefficient tool chain".
-
-   \*/
-
-  minStepsForInefficientChain: number; // Default: 3
-
+```typescript
+export interface Harness2Thresholds {
+  /** Number of user steering / correction events across tasks to trigger a proposal (Default: 3) */
+  userSteeringCount: number;
+  /** Number of explicit instruction-violation / omission / logical-drift questions to trigger (Default: 1, immediate) */
+  instructionViolationQuery: number;
+  /** Cumulative tool inefficiency score across tasks to trigger a skill/tool proposal (Default: 3) */
+  inefficiencyScore: number;
+  /** Number of tasks in which the exact same single-occurrence error fingerprint repeats to trigger (Default: 2) */
+  recurringFingerprintCount: number;
+  /** Number of inferred subagent revision/re-steering events across tasks to trigger (Default: 2) */
+  subagentRevisions: number;
 }
 
-### 2.2 Task Record Schema (`.pi/harness2/records/<id>.json`)
+export interface Harness2Config {
+  /**
+   * "manual" (default): only records when user runs `/harness2` or `/harness2 record`.
+   * "auto": automatically records before compaction (`session_before_compact`) and at session end (`session_shutdown`).
+   */
+  recordMode: "manual" | "auto";
+  /**
+   * Optional model ID for semantic recording and proposal synthesis (e.g. "google/gemini-2.5-flash").
+   * Falls back to the active session model (`ctx.model`) when null/undefined.
+   */
+  model: string | null;
+  /** Trigger thresholds for the workspace */
+  thresholds: Harness2Thresholds;
+  /**
+   * Minimum consecutive failed/exploratory tool calls on the same objective
+   * required to classify a sequence as a multi-step chain (+3 points) vs. single-step retry (+1 point).
+   */
+  minStepsForInefficientChain: number; // Default: 3
+}
+```
 
-Each recorded session produces a compact, structured `TaskRecord` extracted strictly from the **main orchestrator session transcript**:
+### 2.2 Stage 1 Output: Session Digest & Mechanical Facts
 
-export interface ToolChainEvent {
+`src/analyzer.ts` deterministically condenses raw entries into a token-bounded `SessionDigest`:
 
-  turnRange: \[number, number\];
+```typescript
+export interface ToolInvocationSummary {
+  entryIndex: number;
+  toolCallId?: string;
+  toolName: string;
+  inputSummary: string;
+  targetResource?: string;
+  isHardError: boolean;
+  exitCode?: number;
+  outputPreview?: string;
+}
 
-  toolsInvoked: Array\<{
+export interface MechanicalSessionFacts {
+  filesRead: string[];
+  filesWritten: string[];
+  filesEdited: string[];
+  rootScriptsCreated: string[];
+  failedToolCalls: ToolInvocationSummary[];
+  allToolInvocations: ToolInvocationSummary[];
+  subagentInteractions: Array<{
+    subagentName: string;
+    agentProfile?: string;
+    cliRunner: string;
+    spawnEntryIndex: number;
+    initialTaskPrompt: string;
+    followUpMessages: string[];
+    orchestratorEditedSameFiles: string[];
+    hadChildErrorExit: boolean;
+  }>;
+  compactionEntriesRestored: number;
+  networkRetriesIgnored: number;
+}
 
-    toolName: string;
+export interface SessionDigest {
+  sessionId: string;
+  workspacePath: string;
+  modelId?: string;
+  startIndex: number;
+  endIndex: number;
+  totalEntriesAnalyzed: number;
+  totalToolCalls: number;
+  serializedTranscript: string;
+  mechanicalFacts: MechanicalSessionFacts;
+}
+```
 
-    inputSummary: string;
+### 2.3 Stage 2 Output: Task Record Schema (`.pi/harness2/records/<id>.json`)
 
-    isError: boolean;
+The AI Model Judge (or mechanical fallback) outputs a structured `TaskRecord`:
 
-    exitCode?: number;
+```typescript
+export type FrictionFingerprint = string;
 
-    errorSnippet?: string;
-
-  }\>;
-
+export interface ToolInefficiencyEvent {
+  turnRange: [number, number];
+  /**
+   * - "single_retry_recovery": 1 error/hiccup followed by a fix (+1 point).
+   * - "multi_step_chain": >= minStepsForInefficientChain trial-and-error attempts (+3 points).
+   * - "temp_script_sprawl": >= 3 ad-hoc one-off scripts written in workspace root (+3 points).
+   * - "unresolved_error": tool error or dead-end with no successful resolution (+1 point).
+   */
+  classification:
+    | "single_retry_recovery"
+    | "multi_step_chain"
+    | "temp_script_sprawl"
+    | "unresolved_error";
+  scoreWeight: number;
+  fingerprint: FrictionFingerprint;
+  toolsInvoked: ToolInvocationSummary[];
   eventualResolutionCommand?: string;
-
-  classification: "trial\_and\_error\_success" \| "unresolved\_error";
-
+  sprawlScriptsCreated?: string[];
+  description: string;
 }
 
 export interface UserSteeringEvent {
-
-  turnIndex: number;
-
-  eventType: "interruption" \| "tool\_rejection" \| "corrective\_steer" \| "instruction\_compliance\_question";
-
+  entryIndex: number;
+  eventType:
+    | "interruption"
+    | "tool_rejection"
+    | "corrective_steer"
+    | "instruction_compliance_question";
   userMessageQuote: string;
-
   precedingAssistantActionSummary: string;
-
+  rationale?: string;
 }
 
 export interface SubagentInferenceEvent {
-
   subagentName: string;
-
   agentProfile?: string;
-
-  cliRunner: "pi" \| "agy" \| "claude" \| "codex" \| "grok" \| "opencode" \| string;
-
+  cliRunner: "pi" | "agy" | "claude" | "codex" | "grok" | "opencode" | string;
   initialTaskPrompt: string;
-
-  outcomeSignal: "orchestrator\_revised\_files" \| "multiple\_corrective\_messages" \| "child\_error\_exit";
-
-  followUpMessages: string\[\];
-
-  revisedFiles: string\[\];
-
+  outcomeSignal:
+    | "orchestrator_revised_files"
+    | "multiple_corrective_messages"
+    | "child_error_exit";
+  followUpMessages: string[];
+  revisedFiles: string[];
 }
 
 export interface TaskRecord {
-
   recordId: string;
-
   sessionId: string;
-
   timestamp: string;
-
   workspacePath: string;
-
+  modelId?: string;
+  recordedBy: "llm_judge" | "mechanical_fallback";
   userNote?: string;
-
   summary: {
-
-    totalTurns: number;
-
+    totalEntriesAnalyzed: number;
     totalToolCalls: number;
-
     userSteeringCount: number;
-
+    instructionComplianceQuestionCount: number;
     hasInstructionComplianceQuestion: boolean;
-
-    inefficientToolChainCount: number;
-
+    inefficiencyEventCount: number;
+    inefficiencyScoreAdded: number;
     subagentRevisionCount: number;
-
+    networkRetriesIgnored: number;
+    compactionEntriesRestored?: number;
   };
-
-  steeringEvents: UserSteeringEvent\[\];
-
-  inefficientChains: ToolChainEvent\[\];
-
-  subagentEvents: SubagentInferenceEvent\[\];
-
+  steeringEvents: UserSteeringEvent[];
+  inefficiencyEvents: ToolInefficiencyEvent[];
+  subagentEvents: SubagentInferenceEvent[];
 }
+```
 
-### 2.3 Workspace State Schema (`.pi/harness2/state.json`)
+### 2.4 Workspace State Schema (`.pi/harness2/state.json`)
 
-Tracks cumulative counters since the last applied or dismissed proposal:
+Tracks cumulative counters and per-session cursors to avoid duplicate counting:
 
+```typescript
 export interface WorkspaceHarnessState {
-
   schemaVersion: 1;
-
   lastUpdated: string;
-
-  lastRecordedSessionId?: string;
-
-  lastrecordedTurnIndex?: number; // Prevents double-counting when /harness2 record is run multiple times in one session
-
+  /** Map of sessionId -> last analyzed raw entry index for idempotent incremental recording */
+  sessionCursors: Record<string, number>;
   counters: {
-
     sessionsSinceLastProposal: number;
-
     cumulativeUserSteering: number;
-
     cumulativeInstructionQuestions: number;
-
-    cumulativeInefficientChains: number;
-
+    cumulativeInefficiencyScore: number;
     cumulativeSubagentRevisions: number;
-
+    /** Tracks how many tasks encountered each specific semantic FrictionFingerprint */
+    fingerprintCounts: Record<string, number>;
   };
-
   snoozeUntilSessionCount: number;
-
-  recentRecordIds: string\[\];
-
+  recentRecordIds: string[];
+  dismissedProposalSummaries: string[];
 }
+```
 
-## 3\. Core Algorithms: Main Orchestrator Transcript Analysis (`src/analyzer.ts`)
+---
 
-Per requirement, `src/analyzer.ts` inspects **only the main orchestrator session** (`SessionEntry[]` from [@earendil-works/pi-coding-agent](https://pi.dev/docs/latest/extensions)) and never parses external Herdr pane files.
+## 3. Two-Stage Friction Extraction Architecture
 
-### 3.1 Detecting User Steering & Corrections (Threshold \= 3\)
+```
+ Raw Session (disk / branch)
+             │
+             ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ Stage 1: Deterministic Digest (src/analyzer.ts)             │
+ │  • Full branch restoration across compaction boundaries    │
+ │  • Strip <thinking>, images, and skill injections          │
+ │  • Deduplicate provider errors & retracted turns           │
+ │  • Extract MechanicalSessionFacts via AST                  │
+ └───────────────────────────┬─────────────────────────────────┘
+                             │ SessionDigest (~15-25 KB)
+                             ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ Stage 2: AI Model Semantic Recorder (src/recorder.ts)       │
+ │  • Invokes ctx.modelRegistry.complete (cacheRetention: none)│
+ │  • Evaluates prompt rubric semantically (no keyword regex)  │
+ │  • Discovers snake_case fingerprints & reuses prior ones    │
+ │  • Mechanical fallback when offline / no model connected    │
+ └───────────────────────────┬─────────────────────────────────┘
+                             │ TaskRecord
+                             ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ Stage 3: Workspace State, Triggers & Proposals              │
+ │  • Update .pi/harness2/state.json                           │
+ │  • Evaluate thresholds (Rule 1-5 in src/triggers.ts)        │
+ │  • Launch Guided TUI Proposal Flow (src/improver.ts, ui.ts) │
+ └─────────────────────────────────────────────────────────────┘
+```
 
-A `UserSteeringEvent` is logged whenever any of the following occur in the transcript after `lastRecordedTurnIndex`:
+### 3.1 Stage 1: Deterministic Transcript Digest (`src/analyzer.ts`)
 
-1. **Tool Rejection / Block:** A `tool_call` result indicates user rejection (`"was not approved"` or aborted tool execution).  
-2. **Mid-Turn Steer or Interruption:** A user entry arrives while the assistant was mid-task or immediately follows an aborted assistant turn.  
-3. **Corrective Steer Message:** A user message matches corrective patterns (e.g., `"no, don't"`, `"stop"`, `"instead of"`, `"you forgot to"`, `"wrong file"`, `"that's incorrect"`) or an optional manual note passed to `/harness2 record "<note>"`.
+Per requirement, `src/analyzer.ts` inspects **only the main orchestrator session** and never reads external Herdr pane files:
 
-### 3.2 Detecting Explicit Instruction-Failure Queries (Immediate Trigger \= 1\)
+1. **Uncompacted Branch Restoration (`resolveFullUncompactedEntries`)**:
+   Reads `ctx.sessionManager.getBranch()` or the raw `.jsonl` session file from disk. In Pi's session format, compaction only appends a `type: "compaction"` entry to the JSONL log; earlier messages are never erased from disk. `resolveFullUncompactedEntries` recovers 100% of pre-compaction messages.
+2. **Denoising & Token Compression**:
+   - Omits `<thinking>` internal blocks.
+   - Replaces multi-megabyte base64 `image` parts with `[Binary image content omitted from text digest]`.
+   - Filters out retracted assistant turns (`context_edit` with `replacement: null`).
+   - Discards duplicate user retry prompts when immediately preceded by a provider `stopReason: "error"` or context edit. Intentional repeated user messages without provider errors are preserved.
+   - Strips `<skill>` system prompt injection tags.
+   - Result: A 3.7 MB raw `.jsonl` session log is reduced to a concise ~15–25 KB digest.
+3. **Mechanical AST Facts Extraction**:
+   - `filesRead`, `filesWritten`, `filesEdited`: Recorded from tool call arguments.
+   - `rootScriptsCreated`: Flags one-off scripts created in the workspace root (e.g. `script.py`, `helper.mjs`).
+   - `failedToolCalls` and `allToolInvocations`: Recorded from tool results (`isError: true` or `exitCode !== 0`).
+   - `subagentInteractions`: Tracks `subagent` tool calls, target files mentioned, follow-up `subagent_message` calls, subsequent orchestrator edits to subagent-created files, and child error exits.
 
-A user message is flagged as `eventType: "instruction_compliance_question"` when it matches high-precision instruction-audit patterns:
+### 3.2 Stage 2: AI Model Semantic Recorder (`src/recorder.ts`)
 
-- Regex / Heuristic patterns (case-insensitive):  
-  - `/why\s+(didn't|did\s+not|aren't|are\s+not|don't)\s+you\s+(follow|use|read|obey|check|respect)/i`  
-  - `/you\s+(ignored|violated|skipped|forgot|missed)\s+(the\s+)?(instructions?|rules?|agents\.md|skill|guideline)/i`  
-  - `/did\s+you\s+(even\s+)?read\s+(agents\.md|the\s+instructions|the\s+prompt)/i`  
-- Whenever `hasInstructionComplianceQuestion === true`, `src/triggers.ts` immediately returns `shouldPropose = true` with `triggerReason = "EXPLICIT_INSTRUCTION_AUDIT"`.
+Instead of hardcoded regular expressions, an AI Model judges the interaction semantically using Pi's native model registry:
 
-### 3.3 Detecting Inefficient Tool Usage (Trial-and-Error Chains \-\> Skill Candidate)
+1. **Model Invocation (`callPiModel`)**:
+   Invokes `ctx.modelRegistry.complete` with `{ cacheRetention: "none", sessionId: ... }`. If `modelRegistry` is unavailable, it gracefully falls back to `ctx.completePrompt` or `ctx.sendMessage`.
+2. **Recording Rules Rubric**:
+   - **User Steering & Corrections (`steeringEvents`)**: Identifies turns where the user corrects the agent's tone, scope, factual errors, tool selections, or clutter left behind.
+   - **Instruction Compliance / Omission / Logical-Drift Questions (`instruction_compliance_question`)**: Identifies turns where the user asks why instructions or rules in `AGENTS.md` were ignored, or questions why a key hypothesis/premise was omitted or drifted logically.
+   - **Tool Inefficiencies (`inefficiencyEvents`)**:
+     - `single_retry_recovery` (`scoreWeight: 1`): An atomic tool error or flag mistake fixed in 1–2 steps.
+     - `multi_step_chain` (`scoreWeight: 3`): A sequence of $\ge 3$ trial-and-error attempts before succeeding.
+     - `temp_script_sprawl` (`scoreWeight: 3`): Creating $\ge 3$ one-off scripts in the workspace root.
+     - `unresolved_error` (`scoreWeight: 1`): An unresolved tool failure.
+   - **Semantic Fingerprinting**: The model assigns a concise `snake_case` root-cause identifier to each inefficiency event (e.g., `windows_python_gbk_encoding`, `node_esm_module_resolution`). When provided existing workspace fingerprints in the prompt, the model reuses the exact string to track cross-task occurrences.
+   - **Subagent Revisions (`subagentEvents`)**: Identifies when the orchestrator had to rewrite subagent deliverables, send multiple corrective `subagent_message` steers, or handled child error exits.
+3. **Offline / Fallback Builder (`buildRecordFromMechanicalFacts`)**:
+   If the LLM call fails or no provider is connected, falls back to deterministic AST facts extracted in Stage 1 without crashing.
 
-`src/analyzer.ts` slides a window over consecutive assistant tool calls (`bash`, `edit`, `write`, `read`):
+---
 
-1. **Failure / Redundant Probe Identification:** Flags a tool call as an exploratory/failed step if:  
-   - `bash` returns a non-zero exit code (`exitCode !== 0`) or stderr containing command-not-found / argument error / traceback; OR  
-   - `edit` fails due to unmatched target text; OR  
-   - `bash` is invoked \$\\ge 3\$ times in a row targeting the same script/file/command binary with slightly modified flags or inline one-liners (`python3 -c ...`, `jq ...`, `awk ...`, etc.).  
-2. **Resolution Detection:** If a sequence of \$\\ge 3\$ (`minStepsForInefficientChain`) such steps is immediately followed by a **successful** `bash` or tool call on the same resource, `analyzer.ts` records a `ToolChainEvent` with `classification: "trial_and_error_success"` and captures `eventualResolutionCommand`. This provides the exact working recipe for `.pi/skills/<skill-name>/SKILL.md`.
+## 4. Trigger Rules, Improvement Synthesis & Rollback
 
-### 3.4 Inferring Subagent Instruction Problems from the Main Session
+### 4.1 Trigger Rules (`src/triggers.ts`)
 
-Because [interactive-subagents](https://drive.google.com/file/d/1sasZ6hOROTiGDIkQeprSkj1mds_ba26T/view?usp=drivesdk) exposes `subagent` and `subagent_message` as tools in the main orchestrator session and steers completion notifications back into the main session:
+`evaluateTriggers(state, config)` checks the accumulated state against 5 rules:
 
-1. `analyzer.ts` locates every tool call where `toolName === "subagent"`. It extracts `{ agent, cli, name, task }`.  
-2. It tracks subsequent events in the main session associated with that subagent `name`:  
-   - **Condition A (Multiple Corrective Steers):** The orchestrator calls `subagent_message({ name, message })` \$\\ge 2\$ times, or calls `subagent_message` containing corrective keywords (`"fix"`, `"missing"`, `"instead"`, `"redo"`, `"error"`).  
-   - **Condition B (Orchestrator Rewrites Subagent Output):** Within 2 turns after the subagent's completion notification arrives in the main session, the orchestrator calls `edit` or `write` on the exact file paths mentioned in the subagent's task or completion report.  
-   - **Condition C (Child Error Exit):** The steered completion notification in the main transcript reports an error exit (`stopReason: "error"` sidecar message per [CHANGELOG v3.9.0](https://drive.google.com/file/d/1lAnHliH7iUpMbioREtz8oAoOVBqhQTU_/view?usp=drivesdk)).  
-3. If Condition A, B, or C holds, a `SubagentInferenceEvent` is recorded, signaling that the subagent's role definition (`.pi/agents/<agent>.md`) or delegation prompt in `AGENTS.md` needs refinement.
+| Rule | Trigger Reason Code | Default Threshold | Description |
+| :--- | :--- | :---: | :--- |
+| **Rule 1** | `EXPLICIT_INSTRUCTION_AUDIT` | $\ge 1$ (Immediate) | Fired immediately when user asks why instructions/rules were ignored or points out logical omission/drift. |
+| **Rule 2** | `USER_STEERING_THRESHOLD` | $\ge 3$ | Fired when accumulated user corrections reach threshold across tasks. |
+| **Rule 3** | `TOOL_INEFFICIENCY_SCORE_THRESHOLD` | $\ge 3$ | Fired when cumulative tool inefficiency points reach threshold (e.g. one `+3` chain/sprawl or three `+1` retries). |
+| **Rule 4** | `RECURRING_FINGERPRINT_THRESHOLD` | $\ge 2$ tasks | Fired when the exact same single-occurrence error fingerprint occurs in $\ge 2$ distinct tasks. |
+| **Rule 5** | `SUBAGENT_REVISION_THRESHOLD` | $\ge 2$ | Fired when $\ge 2$ subagent runs required orchestrator rewrites or corrective steers. |
 
-## 4\. Reflection & Proposal Synthesis Engine (`src/improver.ts`)
+### 4.2 Reflection & Proposal Synthesis (`src/improver.ts`)
 
-### 4.1 Model Resolution
+Once triggered, `generateHarnessProposal` calls `callPiModel` with the accumulated `TaskRecord` evidence, existing `AGENTS.md`, and `EXPERIENCE.md`.
 
-export function resolveImproverModel(config: Harness2Config, ctx: ExtensionContext): string {
+Target modification paths are strictly confined to authorized harness files:
+- `AGENTS.md` or `AGENTS.override.md`
+- `.pi/APPEND_SYSTEM.md` or `.pi/SYSTEM.md`
+- `.pi/skills/<skill-name>/SKILL.md` (or `.agents/skills/<skill-name>/SKILL.md`)
+- `.pi/agents/<agent-name>.md`
+- `.pi/extensions/<guardrail-name>.ts`
 
-  if (config.model && config.model.trim().length \> 0\) {
+If offline, `synthesizeDeterministicProposal` provides safe baseline proposals from the recorded evidence.
 
-    return config.model.trim();
+### 4.3 Atomic Applier, Backup & Undo Engine (`src/applier.ts`)
 
-  }
+1. **Path Safety (`validateTargetPath`)**:
+   Blocks path traversal (`..`), absolute paths, and any file outside allowed workspace configuration locations. Modifying application source files (e.g. `src/index.ts`) throws `UnauthorizedTargetPathError`.
+2. **Atomic Backup**:
+   Before modifying or creating files, copies existing versions into `.pi/harness2/backups/<timestamp>_<proposalId>/files/` and writes `manifest.json`.
+3. **One-Step Undo (`undoLatestProposal`)**:
+   Restores modified files byte-for-byte from the latest backup manifest, deletes files created by the proposal, restores previous counters, and marks the backup reverted.
 
-  return ctx.model; // Fallback to active session model
+### 4.4 Guided TUI Review (`src/ui.ts`)
 
-}
+Presents an interactive proposal card to the user:
+- `1. Apply Changes (Auto-backup current files)`: Executes atomic apply, logs to `EXPERIENCE.md`, resets counters, and notifies user.
+- `2. Preview Exact File Changes / Diffs`: Displays full content and rationale of each proposed change.
+- `3. Dismiss Proposal (Log reason & reset counter)`: Appends dismissal to `EXPERIENCE.md` and resets counters.
+- `4. Snooze for 1 Session`: Postpones proposal for 1 session.
 
-### 4.2 Contrastive Reflection Prompt & Output Contract
+---
 
-Adapted from [Harness² Section 2.2.1 & 2.3](https://arxiv.org/html/2610.14224v1), `src/improver.ts` prompts the resolved model with the accumulated `TaskRecord` evidence, existing `EXPERIENCE.md`, and current workspace files. The model must return a strict JSON object validated by `@sinclair/typebox`:
+## 5. Host Lifecycle Hooks & CLI Commands (`src/index.ts`)
 
-export interface HarnessProposal {
+### 5.1 Lifecycle Hooks
 
-  proposalId: string;
+- **Pre-Compaction Hook (`session_before_compact`)**:
+  When `recordMode: "auto"`, reads `event.branchEntries` before Pi compacts the context, recording new turns since `state.sessionCursors[sessionId]` without interfering with Pi's compaction.
+- **Session Shutdown Hook (`session_shutdown`)**:
+  When `recordMode: "auto"`, reads remaining turns from the session branch/file and records them at session close.
+- **Per-Session Cursor (`state.sessionCursors`)**:
+  Ensures that entries recorded during `session_before_compact` are never double-counted when `session_shutdown` or `/harness2 record` runs later.
 
-  createdAt: string;
+### 5.2 Slash Commands
 
-  triggerReasons: string\[\];
+- `/harness2` or `/harness2 record [note]`: Record orchestrator transcript, evaluate triggers, and launch proposal review.
+- `/harness2 status`: Show active counters, recurring fingerprints, and configuration.
+- `/harness2 propose [focus]`: Force immediate proposal synthesis even if counters are below threshold.
+- `/harness2 undo`: Roll back the most recently applied proposal in one step.
+- `/harness2 reset`: Reset workspace friction counters to 0 while keeping `EXPERIENCE.md`.
+- `harnees2`: Registered alias for command convenience.
 
-  diagnosisSummary: string; // Plain-English explanation for the user
+---
 
-  experienceEntry: {
+## 6. Test Specification & Verification Matrix
 
-    situation: string;
+The test suite is executed with `npm test` (`node scripts/run-tests.mjs`), requiring zero external dependencies:
 
-    evidenceQuotes: string\[\];
-
-    lessonLearned: string;
-
-  };
-
-  fileOperations: Array\<{
-
-    targetPath: string; // Must be relative to workspace root and match allowlist (AGENTS.md, .pi/APPEND\_SYSTEM.md, .pi/skills/\*\*, .pi/agents/\*\*, .pi/extensions/\*\*)
-
-    operation: "create" \| "update";
-
-    componentType: "agents\_md" \| "append\_system" \| "skill" \| "script" \| "subagent" \| "guardrail\_extension";
-
-    rationale: string;
-
-    fullNewContent: string;
-
-  }\>;
-
-}
-
-### 4.3 Component-Specific Generation Rules
-
-1. **`.pi/agents/<name>.md` (Subagent Profiles):** Must adhere strictly to the YAML frontmatter format from [interactive-subagents README.md](https://drive.google.com/file/d/1sasZ6hOROTiGDIkQeprSkj1mds_ba26T/view?usp=drivesdk):  
-     
-   \---  
-     
-   name: \<agent-name\>  
-     
-   description: \<concise role description\>  
-     
-   model: \<model-or-inherited\>  
-     
-   thinking: medium  
-     
-   tools: read, edit, write, safe\_bash, web\_search  
-     
-   session-mode: lineage-only  
-     
-   auto-exit: true  
-     
-   cli: pi  
-     
-   \---  
-     
-   \<Refined system instructions addressing the exact revision/failure observed in the orchestrator session\>  
-     
-2. **`.pi/skills/<name>/SKILL.md` (Skills):** Must include YAML frontmatter (`name`, `description`) and the exact working command sequence extracted from `eventualResolutionCommand`.  
-3. **`.pi/extensions/<name>.ts` (Project Guardrails):** Must be valid, self-contained TypeScript importing only `type { ExtensionAPI } from "@earendil-works/pi-coding-agent"` and registering deterministic `pi.on("tool_call", ...)` or `pi.on("user_bash", ...)` handlers.  
-4. **Path Traversal Protection:** `src/applier.ts` rejects any `targetPath` that resolves outside `<workspace-root>` or outside the allowed workspace harness paths (`AGENTS.md`, `.pi/APPEND_SYSTEM.md`, `.pi/skills/`, `.pi/agents/`, `.pi/extensions/`, `.pi/harness2/`).
-
-## 5\. Atomic Backup, Apply, and `/harness2 undo` (`src/applier.ts`)
-
-1. **Pre-Apply Snapshot:** Before writing any `fileOperations`, `applier.ts` creates `.pi/harness2/backups/<timestamp>-<proposalId>/`:  
-   - Copies every existing target file into `files/<relative-path>`.  
-   - Writes `manifest.json` listing `{ createdFiles: string[], updatedFiles: string[], previousStateCounters: WorkspaceHarnessState["counters"] }`.  
-2. **Atomic Write:** Writes all proposed files and appends `experienceEntry` to `.pi/harness2/EXPERIENCE.md`. Resets `state.json` counters to `0`.  
-3. **Rollback (`/harness2 undo`):**  
-   - Finds the latest backup directory in `.pi/harness2/backups/`.  
-   - Restores all `updatedFiles` from `files/<relative-path>`.  
-   - Deletes all `createdFiles` that were newly introduced by that proposal.  
-   - Marks the backup as `reverted` and notifies the user to run `/reload`.
-
-## 6\. Comprehensive Test Specification
-
-All tests are written using Node's built-in test runner (`node --test`) or `vitest` with zero external network calls or live LLM API costs during CI.
-
-### 6.1 Unit Test Suite (`test/unit/`)
-
-| Test ID | Module | Test Case Description | Input Fixture / Mock | Expected Assertion |
-| :---- | :---- | :---- | :---- | :---- |
-| **UT-CFG-01** | `config.ts` | Default configuration when no `settings.json` exists | Empty temp `agentDir` and `workspaceDir` | `recordMode === "manual"`, `thresholds.userSteeringCount === 3`, `thresholds.instructionViolationQuery === 1`, `model === null` |
-| **UT-CFG-02** | `config.ts` | Global settings inheritance | `~/.pi/agent/settings.json` has `{ "harness2": { "recordMode": "auto", "model": "google/gemini-3.5-flash" } }` | Resolves `recordMode === "auto"` and `model === "google/gemini-3.5-flash"` |
-| **UT-CFG-03** | `config.ts` | Project-level override precedence over global settings | Global has `recordMode: "auto"`, project `.pi/settings.json` has `recordMode: "manual"` and `thresholds.userSteeringCount: 2` | Resolves `recordMode === "manual"`, `userSteeringCount === 2`, while preserving non-overridden global fields |
-| **UT-ANA-01** | `analyzer.ts` | Counts user steering events across interruptions, tool rejections, and corrective messages | Transcript fixture with 1 rejected `bash` call, 1 user message `"No, stop editing main.py"`, and 1 normal question | `summary.userSteeringCount === 2`; `steeringEvents` has 2 entries with exact quotes |
-| **UT-ANA-02** | `analyzer.ts` | Detects explicit instruction-compliance question | Transcript fixture with user prompt: `"Why didn't you follow the instructions in AGENTS.md about using uv?"` | `summary.hasInstructionComplianceQuestion === true`; `steeringEvents[0].eventType === "instruction_compliance_question"` |
-| **UT-ANA-03** | `analyzer.ts` | Detects trial-and-error tool inefficiency chain (\$\\ge 3\$ failed attempts before success) | Transcript fixture where agent runs 3 failing `bash` commands (`pytest` flag errors, `exitCode: 2`) followed by 1 succeeding `uv run pytest` (`exitCode: 0`) | `summary.inefficientToolChainCount === 1`; `inefficientChains[0].eventualResolutionCommand === "uv run pytest"` |
-| **UT-ANA-04** | `analyzer.ts` | Ignores normal multi-step tool usage that succeeds without trial-and-error | Transcript fixture with `read` `a.ts` \-\> `read` `b.ts` \-\> `edit` `a.ts` \-\> `bash` `npm test` (all `exitCode: 0`) | `summary.inefficientToolChainCount === 0` |
-| **UT-ANA-05** | `analyzer.ts` | Infers subagent instruction problem when orchestrator revises subagent's target file | Main transcript shows `subagent({ agent: "worker", task: "Write src/parser.ts" })`, steered completion arrives, and orchestrator immediately runs `edit` on `src/parser.ts` | `summary.subagentRevisionCount === 1`; `subagentEvents[0].outcomeSignal === "orchestrator_revised_files"` |
-| **UT-ANA-06** | `analyzer.ts` | Infers subagent problem when orchestrator sends \$\\ge 2\$ corrective `subagent_message` calls | Main transcript shows `subagent({ agent: "scout", ... })` followed by 2 `subagent_message({ name: "scout", message: "You missed..." })` calls | `summary.subagentRevisionCount === 1`; `subagentEvents[0].outcomeSignal === "multiple_corrective_messages"` |
-| **UT-ANA-07** | `analyzer.ts` | Idempotent incremental recording within the same session | Run `analyzeTranscript` at turn 10, then run again at turn 15 | Second run only counts events in turns 11–15 (`lastRecordedTurnIndex` respected); zero duplicate counting |
-| **UT-TRG-01** | `triggers.ts` | Triggers when cumulative user steering reaches 3 across multiple sessions | `state.counters.cumulativeUserSteering` goes `1 -> 2 -> 3` across 3 recorded tasks | Returns `shouldPropose: false` on tasks 1 and 2; returns `shouldPropose: true` (`reason: "USER_STEERING_THRESHOLD"`) on task 3 |
-| **UT-TRG-02** | `triggers.ts` | Immediate trigger on explicit instruction compliance query even when all other counters are 0 | `TaskRecord` with `hasInstructionComplianceQuestion: true` and `userSteeringCount: 0` | Returns `shouldPropose: true` immediately (`reason: "EXPLICIT_INSTRUCTION_AUDIT"`) |
-| **UT-APP-01** | `applier.ts` | Blocks path traversal and unauthorized file modifications | Proposal attempting to write `../../etc/passwd` or `src/app.ts` (application source code outside `.pi/` and `AGENTS.md`) | Throws `UnauthorizedTargetPathError`; writes 0 files |
-| **UT-APP-02** | `applier.ts` | Atomic backup creation and `/harness2 undo` restoration | Apply proposal that modifies `AGENTS.md` and creates `.pi/skills/csv-fix/SKILL.md` \+ `.pi/agents/scout.md`, then call `undoLatestProposal()` | Backup manifest verified; after `undo`, `AGENTS.md` matches original byte-for-byte, and `.pi/skills/csv-fix/` & `.pi/agents/scout.md` are removed |
-
-### 6.2 Integration & End-to-End Extension Tests (`test/integration/`)
-
-| Test ID | Scenario | Setup & Mock Harness | Verification Steps |
-| :---- | :---- | :---- | :---- |
-| **IT-CMD-01** | Manual `/harness2 record` end-to-end flow with Guided TUI Apply | Mock `ExtensionAPI` (`pi.registerCommand`, `ctx.ui.select` returning `"Apply Changes"`), mock LLM improver returning a valid `HarnessProposal` | 1\. Invoke `/harness2 record "agent struggled with stata flags"` 2\. Verify `.pi/harness2/records/<id>.json` is created 3\. When threshold crosses, verify `ctx.ui.select` is called with Proposal Summary Card 4\. Verify `.pi/skills/` and `AGENTS.md` are written, backup created, `EXPERIENCE.md` updated, and counters reset to `0` |
-| **IT-CMD-02** | Preview \-\> Apply loop in Guided TUI | Mock `ctx.ui.select` returning `"Preview Exact Changes"` on call 1, then `"Apply Changes"` on call 2 | Verify diff/content preview is displayed via `ctx.ui` on call 1 without writing files, and menu re-prompts on call 2 before applying |
-| **IT-CMD-03** | Dismiss Proposal logs negative experience and resets counters | Mock `ctx.ui.select` returning `"Dismiss Proposal"` | Verify no workspace files (`AGENTS.md`, `.pi/skills/`) are modified, counters reset to `0`, and dismissal is logged so the identical proposal is not repeated |
-| **IT-AUTO-01** | Passive recording in `"recordMode": "auto"` | `.pi/settings.json` configured with `"recordMode": "auto"`; trigger `agent_before_settle` event on mock `ExtensionAPI` | Verify session is recorded automatically without running `/harness2`, and `ctx.ui.notify` alerts user when a threshold is reached |
-| **IT-MOD-01** | Improver model fallback on provider error or missing config | Configure `harness2.model: null` (or an unreachable model ID) while `ctx.model` is `"anthropic/claude-sonnet-4-5"` | Verify `improver.ts` uses `ctx.model` seamlessly and completes proposal generation |
-| **IT-SUB-01** | Generating a valid `interactive-subagents` override profile | Feed transcript where `subagent({ agent: "worker", cli: "pi", task: "..." })` required 2 orchestrator file revisions | Verify generated `.pi/agents/worker.md` contains valid YAML frontmatter (`name`, `description`, `tools`, `cli`, `auto-exit`) parsable by `interactive-subagents` |
-| **IT-EXT-01** | Generating and validating a project-level `.pi/extensions/*.ts` guardrail | Feed transcript where user asked `"Why didn't you follow instructions not to run rm -rf?"` | Verify generated `.pi/extensions/guard-rm.ts` compiles cleanly under TypeScript and exports a valid `default function(pi: ExtensionAPI)` hooking `user_bash` / `tool_call` |
-
-### 6.3 Manual Acceptance Test Checklist (Pre-Release Verification in Pi \+ Herdr)
-
-1. **Install & Command Discovery:** Place extension in `~/.pi/agent/extensions/pi-harness2`, launch `pi` inside a Herdr workspace, run `/reload`, and verify `/harness2` appears in slash autocomplete.  
-2. **Status Inspection:** Run `/harness2 status` in a fresh project folder and confirm all counters display `0` and `recordMode` shows `manual`.  
-3. **Trigger & Apply Cycle:** Simulate 3 corrective steers in a test workspace, run `/harness2 record`, inspect the Proposal Card in the terminal, preview the diff, select **Apply Changes**, and verify `.pi/harness2/EXPERIENCE.md` and the proposed `.pi/` files exist.  
-4. **One-Step Rollback:** Run `/harness2 undo` and confirm the workspace returns to its exact pre-proposal state.
+| Test ID | Suite | Requirement Verified |
+| :--- | :--- | :--- |
+| **UT-CFG-01** | Config | Returns default config when no `settings.json` exists |
+| **UT-CFG-02** | Config | Inherits global settings from `~/.pi/agent/settings.json` |
+| **UT-CFG-03** | Config | Project `.pi/settings.json` overrides global settings; model resolves cleanly |
+| **UT-DIG-01** | Stage 1 Digest | Restores pre-compaction messages across `compaction` entries; strips thinking and images |
+| **UT-DIG-02** | Stage 1 Digest | Ignores `context_edit` retracted turns and provider error retries; preserves intentional repeats |
+| **UT-DIG-03** | Stage 1 Digest | Extracts mechanical facts: root script sprawl, failed tool calls, subagent file revisions |
+| **UT-REC-01** | Stage 2 Recorder | Calls `ctx.modelRegistry.complete` with `SessionDigest` and parses LLM semantic judgment |
+| **UT-TRG-01 & 03** | Stage 2 Triggers | Accumulates single-occurrence frictions (+1) and triggers on recurring fingerprint across tasks |
+| **UT-APP-01** | Applier Safety | Blocks path traversal (`..`) and unauthorized target source paths |
+| **UT-APP-02** | Applier Undo | Creates atomic backup on apply and restores workspace byte-for-byte on `/harness2 undo` |
+| **IT-CMD-01 & 02** | E2E Command | Executes `/harness2 record` with LLM Judge $\to$ Preview $\to$ Apply $\to$ Undo |
+| **IT-AUTO-01** | Auto Hooks | Hooks `session_before_compact` and `session_shutdown` in auto mode without double-counting |
+| **IT-REAL-01 & 02** | Real Logs | Compresses real 3.7 MB session logs into compact digests and feeds LLM Judge |

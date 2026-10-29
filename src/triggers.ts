@@ -92,7 +92,7 @@ export function loadRecentTaskRecords(
   if (!fs.existsSync(recordsDir)) return [];
   const files = fs
     .readdirSync(recordsDir)
-    .filter((f) => f.endsWith(".json"))
+    .filter((f: string) => f.endsWith(".json"))
     .sort()
     .slice(-limit);
   const records: TaskRecord[] = [];

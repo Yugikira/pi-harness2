@@ -201,7 +201,7 @@ export function undoLatestProposal(workspaceDir: string): {
 
   const dirs = fs
     .readdirSync(backupsDir)
-    .filter((d) => fs.statSync(path.join(backupsDir, d)).isDirectory())
+    .filter((d: string) => fs.statSync(path.join(backupsDir, d)).isDirectory())
     .sort()
     .reverse();
 

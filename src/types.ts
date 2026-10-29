@@ -1,6 +1,6 @@
 /**
- * Core TypeScript interfaces and Pi Extension API types for `pi-harness2`.
- * Compatible with `@earendil-works/pi-coding-agent` v0.87+ / v1.0+.
+ * Core TypeScript interfaces and Pi Extension API types for `pi-harness2` v0.3.0.
+ * Implements a Two-Stage (Deterministic Uncompacted Digest -> AI Model Semantic Recorder) architecture.
  */
 
 export interface Harness2Thresholds {
@@ -19,11 +19,11 @@ export interface Harness2Thresholds {
 export interface Harness2Config {
   /**
    * "manual" (default): only records when user runs `/harness2` or `/harness2 record`.
-   * "auto": passively records completed sessions on `agent_before_settle` / session exit.
+   * "auto": automatically records before compaction (`session_before_compact`) and at session end (`session_shutdown`).
    */
   recordMode: "manual" | "auto";
   /**
-   * Optional model ID for reflection and proposal synthesis (e.g. "anthropic/claude-opus-4-8").
+   * Optional model ID for semantic recording and proposal synthesis (e.g. "google/gemini-2.5-flash" or "anthropic/claude-opus-4-8").
    * Falls back to the active session model (`ctx.model`) when null/undefined.
    */
   model: string | null;
@@ -38,17 +38,12 @@ export interface Harness2Config {
   minStepsForInefficientChain: number;
 }
 
-export type FrictionFingerprint =
-  | "python_stdout_encoding_gbk"
-  | "python_inline_syntax_error"
-  | "node_esm_module_resolution"
-  | "cli_usage_argument_error"
-  | "git_outside_repository"
-  | "network_or_api_query_error"
-  | "edit_target_not_found"
-  | "wrong_relative_output_path"
-  | "temp_script_sprawl"
-  | "general_command_failure";
+/**
+ * Semantic snake_case identifier assigned by the AI Recorder (or fallback digest)
+ * to group recurring friction patterns across tasks (e.g. "windows_python_gbk_encoding",
+ * "node_esm_module_resolution", "openalex_root_script_sprawl", "thesis_premise_drift").
+ */
+export type FrictionFingerprint = string;
 
 export interface ToolInvocationSummary {
   entryIndex: number;
@@ -57,18 +52,17 @@ export interface ToolInvocationSummary {
   inputSummary: string;
   targetResource?: string;
   isHardError: boolean;
-  isSoftError: boolean;
   exitCode?: number;
-  errorSnippet?: string;
+  outputPreview?: string;
 }
 
 export interface ToolInefficiencyEvent {
   turnRange: [number, number];
   /**
-   * - "single_retry_recovery": 1 error/failure followed by a fix (+1 point). Ensures frictions occurring once per task are recorded!
-   * - "multi_step_chain": >= minStepsForInefficientChain attempts before resolution (+3 points).
+   * - "single_retry_recovery": 1 error/hiccup followed by a fix (+1 point). Ensures frictions occurring once per task are recorded!
+   * - "multi_step_chain": >= minStepsForInefficientChain trial-and-error or redundant attempts before resolution (+3 points).
    * - "temp_script_sprawl": >= 3 ad-hoc one-off scripts written in workspace root (+3 points).
-   * - "unresolved_error": tool error at end of task with no successful resolution (+1 point).
+   * - "unresolved_error": tool error or dead-end with no successful resolution (+1 point).
    */
   classification:
     | "single_retry_recovery"
@@ -92,6 +86,7 @@ export interface UserSteeringEvent {
     | "instruction_compliance_question";
   userMessageQuote: string;
   precedingAssistantActionSummary: string;
+  rationale?: string;
 }
 
 export interface SubagentInferenceEvent {
@@ -107,12 +102,55 @@ export interface SubagentInferenceEvent {
   revisedFiles: string[];
 }
 
+/**
+ * Stage 1 Output: Deterministic, token-bounded digest of the uncompacted session transcript
+ * ready to be judged by the AI Model in Stage 2 (`src/recorder.ts`).
+ */
+export interface MechanicalSessionFacts {
+  filesRead: string[];
+  filesWritten: string[];
+  filesEdited: string[];
+  rootScriptsCreated: string[];
+  failedToolCalls: ToolInvocationSummary[];
+  allToolInvocations: ToolInvocationSummary[];
+  subagentInteractions: Array<{
+    subagentName: string;
+    agentProfile?: string;
+    cliRunner: string;
+    spawnEntryIndex: number;
+    initialTaskPrompt: string;
+    followUpMessages: string[];
+    orchestratorEditedSameFiles: string[];
+    hadChildErrorExit: boolean;
+  }>;
+  compactionEntriesRestored: number;
+  networkRetriesIgnored: number;
+}
+
+export interface SessionDigest {
+  sessionId: string;
+  workspacePath: string;
+  modelId?: string;
+  startIndex: number;
+  endIndex: number;
+  totalEntriesAnalyzed: number;
+  totalToolCalls: number;
+  /**
+   * Compact, human- and LLM-readable transcript serialized in Pi's `serializeConversation` format
+   * (`[Entry #N | User]`, `[Entry #N | Assistant]`, `[Entry #N | ToolCall]`, `[Entry #N | ToolResult]`),
+   * with `<thinking>` blocks, `<skill>` wrappers, and base64 images stripped.
+   */
+  serializedTranscript: string;
+  mechanicalFacts: MechanicalSessionFacts;
+}
+
 export interface TaskRecord {
   recordId: string;
   sessionId: string;
   timestamp: string;
   workspacePath: string;
   modelId?: string;
+  recordedBy: "llm_judge" | "mechanical_fallback";
   userNote?: string;
   summary: {
     totalEntriesAnalyzed: number;
@@ -124,6 +162,7 @@ export interface TaskRecord {
     inefficiencyScoreAdded: number;
     subagentRevisionCount: number;
     networkRetriesIgnored: number;
+    compactionEntriesRestored?: number;
   };
   steeringEvents: UserSteeringEvent[];
   inefficiencyEvents: ToolInefficiencyEvent[];
@@ -133,7 +172,7 @@ export interface TaskRecord {
 export interface WorkspaceHarnessState {
   schemaVersion: 1;
   lastUpdated: string;
-  /** Map of sessionId -> last analyzed entry index for idempotent incremental recording */
+  /** Map of sessionId -> last analyzed raw entry index for idempotent incremental recording */
   sessionCursors: Record<string, number>;
   counters: {
     sessionsSinceLastProposal: number;
@@ -141,8 +180,8 @@ export interface WorkspaceHarnessState {
     cumulativeInstructionQuestions: number;
     cumulativeInefficiencyScore: number;
     cumulativeSubagentRevisions: number;
-    /** Tracks how many tasks encountered each specific FrictionFingerprint */
-    fingerprintCounts: Partial<Record<FrictionFingerprint, number>>;
+    /** Tracks how many tasks encountered each specific semantic FrictionFingerprint */
+    fingerprintCounts: Record<string, number>;
   };
   snoozeUntilSessionCount: number;
   recentRecordIds: string[];
@@ -172,7 +211,6 @@ export type EditableComponentType =
   | "guardrail_extension";
 
 export interface ProposedFileOperation {
-  /** Path relative to workspace root (e.g. "AGENTS.md", ".pi/skills/openalex/SKILL.md", ".pi/agents/scout.md") */
   targetPath: string;
   operation: "create" | "update";
   componentType: EditableComponentType;
@@ -205,7 +243,7 @@ export interface BackupManifest {
 }
 
 /**
- * Pi SessionEntry JSONL format (v3) as observed in Pi Coding Agent session logs.
+ * Pi SessionEntry JSONL format (v3) including CompactionEntry and ContextEditEntry.
  */
 export interface PiSessionContentPart {
   type: "text" | "thinking" | "toolCall" | "image";
@@ -231,7 +269,15 @@ export interface PiSessionMessage {
 }
 
 export interface PiSessionEntry {
-  type: "session" | "model_change" | "thinking_level_change" | "message" | "context_edit" | string;
+  type:
+    | "session"
+    | "model_change"
+    | "thinking_level_change"
+    | "message"
+    | "context_edit"
+    | "compaction"
+    | "branch_summary"
+    | string;
   id?: string;
   parentId?: string | null;
   timestamp?: string;
@@ -242,12 +288,51 @@ export interface PiSessionEntry {
   thinkingLevel?: string;
   targetId?: string;
   replacement?: unknown;
+  summary?: string;
+  firstKeptEntryId?: string;
   message?: PiSessionMessage;
 }
 
 /**
- * Minimal subset of `@earendil-works/pi-coding-agent` ExtensionAPI used by `pi-harness2`.
+ * Pi ExtensionAPI & ModelRegistry interfaces matching `@earendil-works/pi-coding-agent`.
  */
+export interface PiModelDescriptor {
+  id: string;
+  provider?: string;
+}
+
+export interface PiModelCompletionResponse {
+  content: Array<{ type: string; text?: string }>;
+  usage?: Record<string, unknown>;
+}
+
+export interface PiModelRegistry {
+  find(provider: string, modelId: string): PiModelDescriptor | undefined;
+  complete(
+    model: PiModelDescriptor | string,
+    request: {
+      messages: Array<{
+        role: "user" | "assistant" | "system";
+        content: Array<{ type: "text"; text: string }> | string;
+        timestamp?: number;
+      }>;
+    },
+    options?: {
+      maxTokens?: number;
+      signal?: AbortSignal;
+      cacheRetention?: "none" | "default" | string;
+      sessionId?: string;
+    }
+  ): Promise<PiModelCompletionResponse>;
+}
+
+export interface PiSessionManager {
+  getBranch?(): PiSessionEntry[];
+  getEntries?(): PiSessionEntry[];
+  getSessionFile?(): string | undefined;
+  getSessionId?(): string | undefined;
+}
+
 export interface PiUIContext {
   notify(message: string, level?: "info" | "warning" | "error" | "success"): void;
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -257,11 +342,27 @@ export interface PiUIContext {
 export interface PiCommandContext {
   cwd?: string;
   sessionId?: string;
-  model?: string;
+  model?: string | PiModelDescriptor;
   entries?: PiSessionEntry[];
   sessionFile?: string;
+  sessionManager?: PiSessionManager;
+  modelRegistry?: PiModelRegistry;
+  signal?: AbortSignal;
   ui: PiUIContext;
   sendMessage?(prompt: string, options?: { model?: string }): Promise<string>;
+  completePrompt?(prompt: string, options?: { model?: string }): Promise<string>;
+}
+
+export interface PiSessionBeforeCompactEvent {
+  preparation?: {
+    messagesToSummarize?: unknown[];
+    turnPrefixMessages?: unknown[];
+    firstKeptEntryId?: string;
+    tokensBefore?: number;
+  };
+  branchEntries?: PiSessionEntry[];
+  reason?: "manual" | "threshold" | "overflow" | string;
+  signal?: AbortSignal;
 }
 
 export interface PiExtensionAPI {
@@ -273,7 +374,14 @@ export interface PiExtensionAPI {
     }
   ): void;
   on(
-    event: "agent_before_settle" | "turn_end" | "session_start" | string,
-    handler: (eventData: unknown, ctx: PiCommandContext) => Promise<unknown>
+    event:
+      | "session_before_compact"
+      | "session_shutdown"
+      | "agent_settled"
+      | "agent_before_settle"
+      | "turn_end"
+      | "session_start"
+      | string,
+    handler: (eventData: any, ctx: PiCommandContext) => Promise<unknown>
   ): void;
 }

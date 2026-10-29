@@ -1,14 +1,22 @@
-import * as fs from "node:fs";
 import type {
   PiCommandContext,
   PiExtensionAPI,
+  PiSessionBeforeCompactEvent,
   PiSessionEntry,
 } from "./types.js";
 import { loadHarness2Config } from "./config.js";
 import {
-  analyzeOrchestratorTranscript,
+  buildSessionDigest,
   loadSessionJsonlFile,
+  parseSessionJsonl,
+  resolveFullUncompactedEntries,
 } from "./analyzer.js";
+import {
+  buildRecordFromMechanicalFacts,
+  buildRecorderPrompt,
+  callPiModel,
+  recordSessionWithModel,
+} from "./recorder.js";
 import {
   applyTaskRecordToState,
   evaluateTriggers,
@@ -25,55 +33,75 @@ import {
   runGuidedProposalReview,
 } from "./ui.js";
 
-function resolveEntriesFromContext(ctx: PiCommandContext): PiSessionEntry[] {
-  if (Array.isArray(ctx.entries) && ctx.entries.length > 0) {
-    return ctx.entries;
-  }
-  if (ctx.sessionFile && fs.existsSync(ctx.sessionFile)) {
-    return loadSessionJsonlFile(ctx.sessionFile);
-  }
-  return [];
-}
+export {
+  buildSessionDigest,
+  loadSessionJsonlFile,
+  parseSessionJsonl,
+  resolveFullUncompactedEntries,
+  buildRecordFromMechanicalFacts,
+  buildRecorderPrompt,
+  callPiModel,
+  recordSessionWithModel,
+};
 
 /**
- * Executes a session recording + trigger check cycle.
+ * Executes the Two-Stage Recording + Trigger Check cycle:
+ * 1. Restores the full uncompacted session entry stream (via `resolveFullUncompactedEntries`),
+ *    bridging across any `compaction` entries so pre-compaction messages are never lost.
+ * 2. Condenses new turns since `state.sessionCursors[sessionId]` into a token-bounded `SessionDigest`.
+ * 3. Calls the AI Model (`recordSessionWithModel` via `ctx.modelRegistry.complete`) to semantically
+ *    judge conflicts, steering, and inefficiencies according to the recording rules.
+ * 4. Updates `.pi/harness2/state.json` and launches the Guided Proposal UI if a threshold is met.
  */
 export async function handleRecordAndCheck(
   ctx: PiCommandContext,
   userNote?: string,
-  isAutoHook = false
+  isAutoHook = false,
+  eventBranchEntries?: PiSessionEntry[]
 ): Promise<void> {
   const workspaceDir = ctx.cwd ?? process.cwd();
   const config = loadHarness2Config(workspaceDir);
   const state = loadWorkspaceState(workspaceDir);
-  const entries = resolveEntriesFromContext(ctx);
+  const entries = resolveFullUncompactedEntries(ctx, eventBranchEntries);
 
   const sessionId =
     ctx.sessionId ??
+    ctx.sessionManager?.getSessionId?.() ??
     entries.find((e) => e.type === "session")?.id ??
     "current-session";
   const startIndex = state.sessionCursors[sessionId] ?? 0;
 
-  // If running in auto mode and no new entries exist, do nothing
   if (isAutoHook && entries.length <= startIndex && !userNote) {
     return;
   }
 
-  const record = analyzeOrchestratorTranscript(entries, {
-    sessionId,
-    workspacePath: workspaceDir,
-    startIndex,
-    userNote,
-    config,
-  });
+  const existingFingerprints = Object.keys(state.counters.fingerprintCounts);
+
+  const { record } = await recordSessionWithModel(
+    entries,
+    {
+      sessionId,
+      workspacePath: workspaceDir,
+      startIndex,
+      userNote,
+      existingFingerprints,
+      config,
+    },
+    ctx
+  );
 
   saveTaskRecord(workspaceDir, record);
   applyTaskRecordToState(state, record, entries.length);
   saveWorkspaceState(workspaceDir, state);
 
+  const restoredNote =
+    (record.summary.compactionEntriesRestored ?? 0) > 0
+      ? ` (restored across ${record.summary.compactionEntriesRestored} compaction boundary/boundaries)`
+      : "";
+
   if (!isAutoHook) {
     ctx.ui.notify(
-      `Recorded task (${record.recordId}): +${record.summary.userSteeringCount} steering, +${record.summary.inefficiencyScoreAdded} inefficiency score, +${record.summary.subagentRevisionCount} subagent revisions.`,
+      `Recorded task via ${record.recordedBy} (${record.recordId})${restoredNote}: +${record.summary.userSteeringCount} steering, +${record.summary.inefficiencyScoreAdded} inefficiency score, +${record.summary.subagentRevisionCount} subagent revisions.`,
       "info"
     );
   }
@@ -123,12 +151,17 @@ export async function handleHarness2Command(
     const state = loadWorkspaceState(workspaceDir);
     let recentRecords = loadRecentTaskRecords(workspaceDir, 5);
     if (recentRecords.length === 0) {
-      const entries = resolveEntriesFromContext(ctx);
+      const entries = resolveFullUncompactedEntries(ctx);
       if (entries.length > 0) {
-        const adHocRecord = analyzeOrchestratorTranscript(entries, {
-          workspacePath: workspaceDir,
-          config,
-        });
+        const { record: adHocRecord } = await recordSessionWithModel(
+          entries,
+          {
+            workspacePath: workspaceDir,
+            existingFingerprints: Object.keys(state.counters.fingerprintCounts),
+            config,
+          },
+          ctx
+        );
         saveTaskRecord(workspaceDir, adHocRecord);
         recentRecords = [adHocRecord];
       }
@@ -171,7 +204,6 @@ export async function handleHarness2Command(
     return;
   }
 
-  // If user passed freeform text directly to `/harness2 "some note"`, treat as `record` with note
   await handleRecordAndCheck(
     ctx,
     trimmed.replace(/^["']|["']$/g, ""),
@@ -185,7 +217,7 @@ export async function handleHarness2Command(
 export default function registerHarness2Extension(pi: PiExtensionAPI): void {
   const commandSpec = {
     description:
-      "Record workspace task friction and propose Harness² improvements to AGENTS.md, skills, subagents, and extensions (subcommands: record, status, propose, undo, reset)",
+      "Record workspace task friction via LLM semantic judge and propose Harness² improvements to AGENTS.md, skills, subagents, and extensions (subcommands: record, status, propose, undo, reset)",
     handler: async (args: string, ctx: PiCommandContext) => {
       await handleHarness2Command(args, ctx);
     },
@@ -194,8 +226,25 @@ export default function registerHarness2Extension(pi: PiExtensionAPI): void {
   pi.registerCommand("harness2", commandSpec);
   pi.registerCommand("harnees2", commandSpec);
 
-  // Passive recording hook when `harness2.recordMode` is set to `"auto"`
-  pi.on("agent_before_settle", async (_event: unknown, ctx: PiCommandContext) => {
+  // 1. Pre-Compaction Hook (`session_before_compact`):
+  // When `recordMode: "auto"` is active, records unrecorded turns using `event.branchEntries`
+  // before compaction runs (without cancelling Pi's normal compaction).
+  pi.on(
+    "session_before_compact",
+    async (event: PiSessionBeforeCompactEvent, ctx: PiCommandContext) => {
+      const workspaceDir = ctx?.cwd ?? process.cwd();
+      const config = loadHarness2Config(workspaceDir);
+      if (config.recordMode === "auto") {
+        await handleRecordAndCheck(ctx, undefined, true, event?.branchEntries);
+      }
+      return undefined;
+    }
+  );
+
+  // 2. Unified Session-End Recording Hook (`session_shutdown`):
+  // Because `resolveFullUncompactedEntries` reads `ctx.sessionManager.getBranch()` or the raw `.jsonl` file,
+  // all pre- and post-compaction messages since the last cursor are restored and recorded at session end.
+  pi.on("session_shutdown", async (_event: unknown, ctx: PiCommandContext) => {
     const workspaceDir = ctx?.cwd ?? process.cwd();
     const config = loadHarness2Config(workspaceDir);
     if (config.recordMode === "auto") {

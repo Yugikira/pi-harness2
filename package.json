@@ -1,6 +1,6 @@
 {
   "name": "pi-harness2",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Self-improving local workspace extension for Pi Coding Agent inspired by Google Research's Harness2",
   "type": "module",
   "main": "./index.ts",
@@ -24,11 +24,15 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
       "optional": true
     },
     "@earendil-works/pi-tui": {

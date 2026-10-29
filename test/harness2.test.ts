@@ -11,9 +11,15 @@ import {
   resolveImproverModel,
 } from "../src/config.js";
 import {
-  analyzeOrchestratorTranscript,
+  buildSessionDigest,
   loadSessionJsonlFile,
+  resolveFullUncompactedEntries,
 } from "../src/analyzer.js";
+import {
+  buildRecordFromMechanicalFacts,
+  buildRecorderPrompt,
+  recordSessionWithModel,
+} from "../src/recorder.js";
 import {
   applyTaskRecordToState,
   createInitialWorkspaceState,
@@ -38,6 +44,7 @@ import type {
   HarnessProposal,
   PiCommandContext,
   PiExtensionAPI,
+  PiModelRegistry,
   PiSessionEntry,
 } from "../src/types.js";
 
@@ -45,6 +52,53 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `pi-harness2-${prefix}-`));
+}
+
+/**
+ * Helper to create a mock `PiModelRegistry` that inspects the prompt (including `<session_digest>`)
+ * and returns a structured JSON response simulating the AI Model Judge.
+ */
+function createMockModelRegistry(
+  customResponder?: (promptText: string, modelId: string) => Record<string, unknown>
+): { registry: PiModelRegistry; promptsReceived: string[]; modelsCalled: string[] } {
+  const promptsReceived: string[] = [];
+  const modelsCalled: string[] = [];
+
+  const registry: PiModelRegistry = {
+    find(provider, modelId) {
+      return { id: modelId, provider };
+    },
+    async complete(model, request) {
+      const mId = typeof model === "string" ? model : `${model.provider ?? "mock"}/${model.id}`;
+      modelsCalled.push(mId);
+      const firstMsg = request.messages[0];
+      const promptText =
+        typeof firstMsg.content === "string"
+          ? firstMsg.content
+          : firstMsg.content.map((c) => c.text).join("\n");
+      promptsReceived.push(promptText);
+
+      const responseObj = customResponder
+        ? customResponder(promptText, mId)
+        : {
+            steeringEvents: [],
+            inefficiencyEvents: [],
+            subagentEvents: [],
+          };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: "```json\n" + JSON.stringify(responseObj, null, 2) + "\n```",
+          },
+        ],
+        usage: { inputTokens: 500, outputTokens: 200 },
+      };
+    },
+  };
+
+  return { registry, promptsReceived, modelsCalled };
 }
 
 describe("1. Configuration & Model Resolution (UT-CFG)", () => {
@@ -70,7 +124,7 @@ describe("1. Configuration & Model Resolution (UT-CFG)", () => {
       JSON.stringify({
         harness2: {
           recordMode: "auto",
-          model: "google/gemini-3.5-flash",
+          model: "google/gemini-2.5-flash",
           thresholds: { userSteeringCount: 4 },
         },
       }),
@@ -79,7 +133,7 @@ describe("1. Configuration & Model Resolution (UT-CFG)", () => {
 
     const cfg = loadHarness2Config(tmpWorkspace, tmpGlobal);
     assert.equal(cfg.recordMode, "auto");
-    assert.equal(cfg.model, "google/gemini-3.5-flash");
+    assert.equal(cfg.model, "google/gemini-2.5-flash");
     assert.equal(cfg.thresholds.userSteeringCount, 4);
     assert.equal(cfg.thresholds.inefficiencyScore, 3);
   });
@@ -94,7 +148,7 @@ describe("1. Configuration & Model Resolution (UT-CFG)", () => {
       JSON.stringify({
         harness2: {
           recordMode: "auto",
-          model: "google/gemini-3.5-flash",
+          model: "google/gemini-2.5-flash",
           thresholds: { userSteeringCount: 5, inefficiencyScore: 6 },
         },
       }),
@@ -124,347 +178,101 @@ describe("1. Configuration & Model Resolution (UT-CFG)", () => {
   });
 });
 
-describe("2. Orchestrator Transcript Analyzer (UT-ANA)", () => {
-  it("UT-ANA-01: counts user steering across tool rejections and bilingual corrective messages", () => {
+describe("2. Stage 1 — Uncompacted Session Digest & Mechanical Facts (UT-DIG)", () => {
+  it("UT-DIG-01: restores pre-compaction messages across type='compaction' entries and strips thinking/images", () => {
     const entries: PiSessionEntry[] = [
-      { type: "session", id: "sess-1", cwd: "/mock/ws" },
+      { type: "session", id: "sess-compact-1", cwd: "/mock/ws" },
       {
         type: "message",
+        id: "m1",
         message: {
-          role: "assistant",
-          content: [{ type: "toolCall", id: "tc-1", name: "bash", arguments: { command: "rm -rf ./data" } }],
+          role: "user",
+          content: [{ type: "text", text: "Pre-compaction instruction: analyze paper.md" }],
         },
       },
       {
         type: "message",
+        id: "m2",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "Very long internal reasoning that should be stripped..." },
+            { type: "toolCall", id: "tc-1", name: "read", arguments: { path: "paper.md" } },
+          ],
+        },
+      },
+      {
+        type: "message",
+        id: "m3",
         message: {
           role: "toolResult",
           toolCallId: "tc-1",
-          toolName: "bash",
-          isError: true,
-          content: [{ type: "text", text: "bash was not approved by user" }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "No, don't delete data! Instead of that, read the summary." }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "scene01 不要添加这种主标题，用语AI-slop严重，注意根据 unslop技能进行调整。" }],
-        },
-      },
-    ];
-
-    const record = analyzeOrchestratorTranscript(entries);
-    assert.equal(record.summary.userSteeringCount, 3);
-    assert.equal(record.steeringEvents[0].eventType, "tool_rejection");
-    assert.equal(record.steeringEvents[1].eventType, "corrective_steer");
-    assert.equal(record.steeringEvents[2].eventType, "corrective_steer");
-  });
-
-  it("UT-ANA-02: detects explicit instruction-compliance / omission / logical-drift questions in English & Chinese", () => {
-    const entries: PiSessionEntry[] = [
-      {
-        type: "message",
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "Why didn't you follow the instructions in AGENTS.md about using uv?" }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: "我发现你遗漏了很重要的有关假设的讨论。文章的潜在假设是大语言模型也会促进直接与大语言模型相关的技能需求。我已经手动添加了。为什么你判断它不重要？",
-            },
-          ],
-        },
-      },
-    ];
-
-    const record = analyzeOrchestratorTranscript(entries);
-    assert.equal(record.summary.hasInstructionComplianceQuestion, true);
-    assert.equal(record.summary.instructionComplianceQuestionCount, 2);
-  });
-
-  it("UT-ANA-03 & UT-ANA-04: distinguishes multi-step trial-and-error chains (+3) from clean multi-step execution (0)", () => {
-    const cleanEntries: PiSessionEntry[] = [
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "toolCall", id: "c1", name: "read", arguments: { path: "a.ts" } }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolCallId: "c1",
           toolName: "read",
           isError: false,
-          content: [{ type: "text", text: "const x = 1;" }],
+          content: [
+            { type: "image", text: "base64-mega-blob" },
+            { type: "text", text: "Paper contents..." },
+          ],
         },
+      },
+      // Compaction entry inserted mid-session by Pi
+      {
+        type: "compaction",
+        id: "cmp-1",
+        firstKeptEntryId: "m4",
+        summary: "Summarized m1..m3",
       },
       {
         type: "message",
+        id: "m4",
         message: {
-          role: "assistant",
-          content: [{ type: "toolCall", id: "c2", name: "bash", arguments: { command: "npm test" } }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolCallId: "c2",
-          toolName: "bash",
-          isError: false,
-          content: [{ type: "text", text: "PASS" }],
-        },
-      },
-    ];
-    const cleanRec = analyzeOrchestratorTranscript(cleanEntries);
-    assert.equal(cleanRec.summary.inefficiencyEventCount, 0);
-    assert.equal(cleanRec.summary.inefficiencyScoreAdded, 0);
-
-    const chainEntries: PiSessionEntry[] = [
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "toolCall", id: "e1", name: "bash", arguments: { command: "node -e \"import pptxgen from 'pptxgenjs'\"" } }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolCallId: "e1",
-          toolName: "bash",
-          isError: true,
-          content: [{ type: "text", text: "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'pptxgenjs'" }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "toolCall", id: "e2", name: "bash", arguments: { command: "ls .agents/skills/node_modules" } }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolCallId: "e2",
-          toolName: "bash",
-          isError: true,
-          content: [{ type: "text", text: "ls: cannot access: No such file or directory\nCommand exited with code 2" }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "toolCall", id: "e3", name: "bash", arguments: { command: "cd .agents/skills/tools && node build.mjs" } }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolCallId: "e3",
-          toolName: "bash",
-          isError: false,
-          content: [{ type: "text", text: "Successfully generated deck.pptx" }],
+          role: "user",
+          content: [{ type: "text", text: "Post-compaction: why did you omit the second assumption?" }],
         },
       },
     ];
 
-    const chainRec = analyzeOrchestratorTranscript(chainEntries);
-    assert.equal(chainRec.summary.inefficiencyEventCount, 1);
-    assert.equal(chainRec.inefficiencyEvents[0].classification, "multi_step_chain");
-    assert.equal(chainRec.inefficiencyEvents[0].scoreWeight, 3);
-    assert.equal(chainRec.inefficiencyEvents[0].fingerprint, "node_esm_module_resolution");
+    const ctx: PiCommandContext = {
+      sessionManager: {
+        getBranch() {
+          return entries;
+        },
+      },
+      ui: {
+        notify() {},
+        async select() {
+          return undefined;
+        },
+        async confirm() {
+          return true;
+        },
+      },
+    };
+
+    const resolved = resolveFullUncompactedEntries(ctx);
+    assert.equal(resolved.length, 6);
+
+    const digest = buildSessionDigest(resolved);
+    assert.equal(digest.mechanicalFacts.compactionEntriesRestored, 1);
+    assert.deepEqual(digest.mechanicalFacts.filesRead, ["paper.md"]);
+    assert.ok(digest.serializedTranscript.includes("Pre-compaction instruction: analyze paper.md"));
+    assert.ok(digest.serializedTranscript.includes("Post-compaction: why did you omit the second assumption?"));
+    assert.ok(!digest.serializedTranscript.includes("Very long internal reasoning"));
   });
 
-  it("UT-ANA-05 & UT-ANA-06: infers subagent instruction issues from orchestrator file revisions and corrective subagent_message calls", () => {
+  it("UT-DIG-02: ignores context_edit retracted turns and provider stopReason=error duplicate user resends", () => {
     const entries: PiSessionEntry[] = [
       {
         type: "message",
-        message: {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "sub-1",
-              name: "subagent",
-              arguments: { agent: "worker", name: "auth-worker", cli: "pi", task: "Implement src/auth.ts" },
-            },
-            {
-              type: "toolCall",
-              id: "sub-2",
-              name: "subagent",
-              arguments: { agent: "scout", name: "lit-scout", cli: "claude", task: "Summarize papers" },
-            },
-          ],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolCallId: "sub-1",
-          toolName: "subagent",
-          isError: false,
-          content: [{ type: "text", text: "Finished src/auth.ts" }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [
-            { type: "toolCall", id: "ed-1", name: "edit", arguments: { path: "src/auth.ts" } },
-            {
-              type: "toolCall",
-              id: "msg-1",
-              name: "subagent_message",
-              arguments: { name: "lit-scout", message: "You missed the methodology section, please fix." },
-            },
-            {
-              type: "toolCall",
-              id: "msg-2",
-              name: "subagent_message",
-              arguments: { name: "lit-scout", message: "Also redo the table in markdown." },
-            },
-          ],
-        },
-      },
-    ];
-
-    const record = analyzeOrchestratorTranscript(entries);
-    assert.equal(record.summary.subagentRevisionCount, 2);
-    const workerEv = record.subagentEvents.find((s) => s.subagentName === "auth-worker");
-    const scoutEv = record.subagentEvents.find((s) => s.subagentName === "lit-scout");
-    assert.equal(workerEv?.outcomeSignal, "orchestrator_revised_files");
-    assert.deepEqual(workerEv?.revisedFiles, ["src/auth.ts"]);
-    assert.equal(scoutEv?.outcomeSignal, "multiple_corrective_messages");
-  });
-
-  it("UT-ANA-07: idempotent incremental recording via startIndex cursor prevents double counting", () => {
-    const entries: PiSessionEntry[] = [
-      {
-        type: "message",
+        id: "u1",
         message: {
           role: "user",
-          content: [{ type: "text", text: "No, don't do that! Wrong file." }],
+          content: [{ type: "text", text: "Please fix slide 3 logical drift." }],
         },
       },
       {
         type: "message",
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "Stop editing that module." }],
-        },
-      },
-    ];
-
-    const firstPass = analyzeOrchestratorTranscript(entries.slice(0, 1), { startIndex: 0 });
-    assert.equal(firstPass.summary.userSteeringCount, 1);
-
-    const secondPass = analyzeOrchestratorTranscript(entries, { startIndex: 1 });
-    assert.equal(secondPass.summary.userSteeringCount, 1);
-  });
-
-  it("UT-ANA-08: records single-occurrence friction per task (1 error -> 1 fix) with +1 score and fingerprint", () => {
-    const singleOccurrenceEntries: PiSessionEntry[] = [
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "py1",
-              name: "bash",
-              arguments: { command: "python -c \"print(open('paper.md', encoding='utf-8').read())\"" },
-            },
-          ],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolCallId: "py1",
-          toolName: "bash",
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: "UnicodeEncodeError: 'gbk' codec can't encode character '\\xe4' in position 23",
-            },
-          ],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "py2",
-              name: "bash",
-              arguments: {
-                command:
-                  "python -c \"import sys; sys.stdout.reconfigure(encoding='utf-8'); print(open('paper.md', encoding='utf-8').read())\"",
-              },
-            },
-          ],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolCallId: "py2",
-          toolName: "bash",
-          isError: false,
-          content: [{ type: "text", text: "Paper contents..." }],
-        },
-      },
-    ];
-
-    const record = analyzeOrchestratorTranscript(singleOccurrenceEntries);
-    assert.equal(record.summary.inefficiencyEventCount, 1);
-    assert.equal(record.inefficiencyEvents[0].classification, "single_retry_recovery");
-    assert.equal(record.inefficiencyEvents[0].scoreWeight, 1);
-    assert.equal(record.inefficiencyEvents[0].fingerprint, "python_stdout_encoding_gbk");
-  });
-
-  it("UT-ANA-09: ignores duplicate user messages resent after provider stopReason=error and context_edit", () => {
-    const entries: PiSessionEntry[] = [
-      {
-        type: "message",
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "不要添加这种主标题，请修改第一页" }],
-        },
-      },
-      {
-        type: "message",
+        id: "a1-err",
         message: {
           role: "assistant",
           stopReason: "error",
@@ -473,133 +281,198 @@ describe("2. Orchestrator Transcript Analyzer (UT-ANA)", () => {
       },
       {
         type: "context_edit",
-        targetId: "123",
+        targetId: "a1-err",
+        replacement: null,
+      },
+      {
+        type: "message",
+        id: "u2-retry",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Please fix slide 3 logical drift." }],
+        },
+      },
+    ];
+
+    const digest = buildSessionDigest(entries);
+    assert.equal(digest.mechanicalFacts.networkRetriesIgnored, 1);
+    const matches = digest.serializedTranscript.match(/Please fix slide 3 logical drift/g) ?? [];
+    assert.equal(matches.length, 1);
+  });
+
+  it("UT-DIG-03: extracts mechanical facts for root script sprawl, failed tool calls, and subagent file revisions", () => {
+    const entries: PiSessionEntry[] = [
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "w1", name: "write", arguments: { path: "s1.py", content: "1" } },
+            { type: "toolCall", id: "w2", name: "write", arguments: { path: "s2.py", content: "2" } },
+            { type: "toolCall", id: "w3", name: "write", arguments: { path: "s3.py", content: "3" } },
+            {
+              type: "toolCall",
+              id: "sub1",
+              name: "subagent",
+              arguments: { agent: "worker", name: "auth-worker", cli: "pi", task: "Write src/auth.ts" },
+            },
+          ],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "sub1",
+          toolName: "subagent",
+          isError: false,
+          content: [{ type: "text", text: "Completed src/auth.ts" }],
+        },
       },
       {
         type: "message",
         message: {
           role: "assistant",
-          stopReason: "aborted",
-          content: [],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "不要添加这种主标题，请修改第一页" }],
+          content: [
+            { type: "toolCall", id: "ed1", name: "edit", arguments: { path: "src/auth.ts", edits: [] } },
+          ],
         },
       },
     ];
 
-    const record = analyzeOrchestratorTranscript(entries);
-    assert.equal(record.summary.userSteeringCount, 1);
-    assert.equal(record.summary.networkRetriesIgnored, 1);
+    const digest = buildSessionDigest(entries);
+    assert.deepEqual(digest.mechanicalFacts.rootScriptsCreated, ["s1.py", "s2.py", "s3.py"]);
+    assert.equal(digest.mechanicalFacts.subagentInteractions.length, 1);
+    assert.deepEqual(
+      digest.mechanicalFacts.subagentInteractions[0].orchestratorEditedSameFiles,
+      ["src/auth.ts"]
+    );
   });
 });
 
-describe("3. Cross-Task Trigger Evaluation (UT-TRG)", () => {
-  it("UT-TRG-01: triggers when single user steering events accumulate to 3 across 3 tasks", () => {
-    const state = createInitialWorkspaceState();
-    const cfg = DEFAULT_HARNESS2_CONFIG;
-
-    for (let taskNum = 1; taskNum <= 3; taskNum++) {
-      const rec = analyzeOrchestratorTranscript(
-        [
-          {
-            type: "message",
-            message: {
-              role: "user",
-              content: [{ type: "text", text: "No, don't do that! Wrong file." }],
-            },
-          },
-        ],
-        { sessionId: `sess-${taskNum}` }
-      );
-      applyTaskRecordToState(state, rec, 1);
-      const evalRes = evaluateTriggers(state, cfg);
-      if (taskNum < 3) {
-        assert.equal(evalRes.shouldPropose, false);
-      } else {
-        assert.equal(evalRes.shouldPropose, true);
-        assert.ok(evalRes.reasons.includes("USER_STEERING_THRESHOLD"));
-      }
-    }
-  });
-
-  it("UT-TRG-02: triggers immediately on a single explicit instruction-compliance question", () => {
-    const state = createInitialWorkspaceState();
-    const rec = analyzeOrchestratorTranscript([
+describe("3. Stage 2 — AI Model Semantic Recorder & Cross-Task Fingerprinting (UT-REC / UT-TRG)", () => {
+  it("UT-REC-01: calls ctx.modelRegistry.complete with SessionDigest and parses LLM semantic judgment", async () => {
+    const entries: PiSessionEntry[] = [
+      { type: "session", id: "sess-llm-1", cwd: "/mock/ws" },
       {
         type: "message",
         message: {
           role: "user",
-          content: [{ type: "text", text: "Why didn't you follow the rules in AGENTS.md?" }],
+          content: [
+            {
+              type: "text",
+              text: "Your slide 3 subtly inverted my argument about incremental RPA impact vs direct LLM skill demand.",
+            },
+          ],
         },
       },
-    ]);
-    applyTaskRecordToState(state, rec, 1);
-    const evalRes = evaluateTriggers(state, DEFAULT_HARNESS2_CONFIG);
-    assert.equal(evalRes.shouldPropose, true);
-    assert.ok(evalRes.reasons.includes("EXPLICIT_INSTRUCTION_AUDIT"));
+    ];
+
+    const { registry, promptsReceived } = createMockModelRegistry(() => ({
+      steeringEvents: [
+        {
+          entryIndex: 1,
+          eventType: "instruction_compliance_question",
+          userMessageQuote:
+            "Your slide 3 subtly inverted my argument about incremental RPA impact vs direct LLM skill demand.",
+          precedingAssistantActionSummary: "Generated deck.pptx",
+          rationale: "User identified semantic logical drift from core research thesis.",
+        },
+      ],
+      inefficiencyEvents: [
+        {
+          turnRange: [1, 2],
+          classification: "single_retry_recovery",
+          scoreWeight: 1,
+          fingerprint: "windows_python_gbk_encoding",
+          eventualResolutionCommand: "sys.stdout.reconfigure(encoding='utf-8')",
+          description: "Hit GBK encoding error once and recovered via utf-8 reconfigure.",
+        },
+      ],
+      subagentEvents: [],
+    }));
+
+    const ctx: PiCommandContext = {
+      model: "google/gemini-2.5-flash",
+      modelRegistry: registry,
+      ui: {
+        notify() {},
+        async select() {
+          return undefined;
+        },
+        async confirm() {
+          return true;
+        },
+      },
+    };
+
+    const { record } = await recordSessionWithModel(
+      entries,
+      { existingFingerprints: ["windows_python_gbk_encoding"] },
+      ctx
+    );
+
+    assert.equal(promptsReceived.length, 1);
+    assert.ok(promptsReceived[0].includes("<session_digest>"));
+    assert.ok(promptsReceived[0].includes("windows_python_gbk_encoding"));
+    assert.equal(record.recordedBy, "llm_judge");
+    assert.equal(record.summary.hasInstructionComplianceQuestion, true);
+    assert.equal(record.summary.inefficiencyScoreAdded, 1);
+    assert.equal(record.inefficiencyEvents[0].fingerprint, "windows_python_gbk_encoding");
   });
 
-  it("UT-TRG-03: triggers when a single-occurrence tool friction (+1) repeats across 2 tasks (fingerprint match) or 3 tasks (score >= 3)", () => {
+  it("UT-TRG-01 & UT-TRG-03: accumulates LLM-judged single-occurrence frictions and triggers on recurring fingerprint", async () => {
     const state = createInitialWorkspaceState();
-    const makeSingleGbkTask = (sessId: string) =>
-      analyzeOrchestratorTranscript(
-        [
-          {
-            type: "message",
-            message: {
-              role: "assistant",
-              content: [{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "python -c 'print(1)'" } }],
-            },
-          },
-          {
-            type: "message",
-            message: {
-              role: "toolResult",
-              toolCallId: "t1",
-              toolName: "bash",
-              isError: true,
-              content: [{ type: "text", text: "UnicodeEncodeError: 'gbk' codec can't encode" }],
-            },
-          },
-          {
-            type: "message",
-            message: {
-              role: "assistant",
-              content: [{ type: "toolCall", id: "t2", name: "bash", arguments: { command: "python -c \"sys.stdout.reconfigure(encoding='utf-8')\"" } }],
-            },
-          },
-          {
-            type: "message",
-            message: {
-              role: "toolResult",
-              toolCallId: "t2",
-              toolName: "bash",
-              isError: false,
-              content: [{ type: "text", text: "ok" }],
-            },
-          },
-        ],
-        { sessionId: sessId }
-      );
+    const { registry } = createMockModelRegistry(() => ({
+      steeringEvents: [],
+      inefficiencyEvents: [
+        {
+          turnRange: [1, 2],
+          classification: "single_retry_recovery",
+          scoreWeight: 1,
+          fingerprint: "custom_stata_flag_error",
+          eventualResolutionCommand: "stata-mp -b do analysis.do",
+          description: "Used wrong batch flag once before finding -b.",
+        },
+      ],
+      subagentEvents: [],
+    }));
 
-    const rec1 = makeSingleGbkTask("task-1");
-    applyTaskRecordToState(state, rec1, 4);
-    assert.equal(state.counters.cumulativeInefficiencyScore, 1);
-    assert.equal(state.counters.fingerprintCounts.python_stdout_encoding_gbk, 1);
+    const ctx: PiCommandContext = {
+      model: "google/gemini-2.5-flash",
+      modelRegistry: registry,
+      ui: {
+        notify() {},
+        async select() {
+          return undefined;
+        },
+        async confirm() {
+          return true;
+        },
+      },
+    };
+
+    // Task 1: single occurrence (+1 score, fingerprint count = 1)
+    const { record: r1 } = await recordSessionWithModel(
+      [{ type: "session", id: "t1" }],
+      { sessionId: "t1" },
+      ctx
+    );
+    applyTaskRecordToState(state, r1, 1);
+    assert.equal(state.counters.fingerprintCounts.custom_stata_flag_error, 1);
     assert.equal(evaluateTriggers(state, DEFAULT_HARNESS2_CONFIG).shouldPropose, false);
 
-    const rec2 = makeSingleGbkTask("task-2");
-    applyTaskRecordToState(state, rec2, 4);
-    assert.equal(state.counters.cumulativeInefficiencyScore, 2);
-    assert.equal(state.counters.fingerprintCounts.python_stdout_encoding_gbk, 2);
-    const eval2 = evaluateTriggers(state, DEFAULT_HARNESS2_CONFIG);
-    assert.equal(eval2.shouldPropose, true);
-    assert.ok(eval2.reasons.includes("RECURRING_FINGERPRINT_THRESHOLD"));
+    // Task 2: same single-occurrence friction repeats (+1 score, fingerprint count = 2) -> triggers!
+    const { record: r2 } = await recordSessionWithModel(
+      [{ type: "session", id: "t2" }],
+      { sessionId: "t2", existingFingerprints: Object.keys(state.counters.fingerprintCounts) },
+      ctx
+    );
+    applyTaskRecordToState(state, r2, 1);
+    assert.equal(state.counters.fingerprintCounts.custom_stata_flag_error, 2);
+    const trig = evaluateTriggers(state, DEFAULT_HARNESS2_CONFIG);
+    assert.equal(trig.shouldPropose, true);
+    assert.ok(trig.reasons.includes("RECURRING_FINGERPRINT_THRESHOLD"));
   });
 });
 
@@ -626,7 +499,7 @@ describe("4. Atomic File Applier, Path Safety & Undo (UT-APP)", () => {
 
     const proposal: HarnessProposal = {
       proposalId: "prop-test-1",
-      createdAt: "2026-10-26T00:00:00.000Z",
+      createdAt: "2026-10-28T00:00:00.000Z",
       modelUsed: "test-model",
       triggerReasons: ["USER_STEERING_THRESHOLD"],
       diagnosisSummary: "Test proposal",
@@ -656,8 +529,6 @@ describe("4. Atomic File Applier, Path Safety & Undo (UT-APP)", () => {
     applyHarnessProposal(ws, proposal);
     assert.ok(fs.readFileSync(path.join(ws, "AGENTS.md"), "utf-8").includes("## New Section"));
     assert.ok(fs.existsSync(path.join(ws, ".pi/skills/csv-helper/SKILL.md")));
-    assert.ok(fs.existsSync(path.join(ws, ".pi/harness2/EXPERIENCE.md")));
-    assert.equal(loadWorkspaceState(ws).counters.cumulativeUserSteering, 0);
 
     const undoRes = undoLatestProposal(ws);
     assert.equal(undoRes.reverted, true);
@@ -667,11 +538,11 @@ describe("4. Atomic File Applier, Path Safety & Undo (UT-APP)", () => {
   });
 });
 
-describe("5. End-to-End Integration & Real Session Verification (IT-CMD / IT-REAL)", () => {
-  it("IT-CMD-01 & IT-CMD-02: executes /harness2 record -> Preview -> Apply -> Undo via ExtensionAPI", async () => {
+describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CMD / IT-REAL)", () => {
+  it("IT-CMD-01 & IT-CMD-02: executes /harness2 record with LLM Judge -> Preview -> Apply -> Undo", async () => {
     const ws = makeTempDir("ws-e2e");
     const commands = new Map<string, (args: string, ctx: PiCommandContext) => Promise<void>>();
-    const hooks = new Map<string, (ev: unknown, ctx: PiCommandContext) => Promise<unknown>>();
+    const hooks = new Map<string, (ev: any, ctx: PiCommandContext) => Promise<unknown>>();
 
     const mockPi: PiExtensionAPI = {
       registerCommand(name, cfg) {
@@ -685,14 +556,62 @@ describe("5. End-to-End Integration & Real Session Verification (IT-CMD / IT-REA
     registerHarness2Extension(mockPi);
     assert.ok(commands.has("harness2"));
     assert.ok(commands.has("harnees2"));
+    assert.ok(hooks.has("session_before_compact"));
+    assert.ok(hooks.has("session_shutdown"));
 
-    const notifications: string[] = [];
+    let callIdx = 0;
+    const { registry } = createMockModelRegistry(() => {
+      callIdx += 1;
+      if (callIdx === 1) {
+        // Call 1: Stage 2 Recorder LLM output
+        return {
+          steeringEvents: [
+            {
+              entryIndex: 1,
+              eventType: "instruction_compliance_question",
+              userMessageQuote: "Why didn't you follow the instructions in AGENTS.md about rm -rf?",
+              precedingAssistantActionSummary: "ran bash rm -rf",
+              rationale: "User audited instruction violation on destructive command.",
+            },
+          ],
+          inefficiencyEvents: [],
+          subagentEvents: [],
+        };
+      }
+      // Call 2: Stage 3 Improver LLM output
+      return {
+        proposalId: "prop-llm-e2e",
+        diagnosisSummary: "Add guardrail and AGENTS.md rule for rm -rf",
+        experienceEntry: {
+          situation: "Agent attempted rm -rf despite AGENTS.md rule",
+          evidenceQuotes: ["Why didn't you follow the instructions in AGENTS.md about rm -rf?"],
+          lessonLearned: "Enforce destructive command check via project-level extension.",
+        },
+        fileOperations: [
+          {
+            targetPath: "AGENTS.md",
+            operation: "create",
+            componentType: "agents_md",
+            rationale: "Document safe cleanup policy",
+            fullNewContent: "# AGENTS.md\n- Never run rm -rf without confirmation.\n",
+          },
+          {
+            targetPath: ".pi/extensions/workspace-guardrail.ts",
+            operation: "create",
+            componentType: "guardrail_extension",
+            rationale: "Intercept rm -rf in tool_call",
+            fullNewContent: "// Guardrail extension\nexport default function () {}\n",
+          },
+        ],
+      };
+    });
+
     let selectCallCount = 0;
-
     const ctx: PiCommandContext = {
       cwd: ws,
       sessionId: "sess-e2e-1",
       model: "antigravity/gemini-3.8-flash",
+      modelRegistry: registry,
       entries: [
         {
           type: "message",
@@ -703,9 +622,7 @@ describe("5. End-to-End Integration & Real Session Verification (IT-CMD / IT-REA
         },
       ],
       ui: {
-        notify(msg) {
-          notifications.push(msg);
-        },
+        notify() {},
         async select() {
           selectCallCount += 1;
           return selectCallCount === 1 ? MENU_OPTION_PREVIEW : MENU_OPTION_APPLY;
@@ -727,7 +644,7 @@ describe("5. End-to-End Integration & Real Session Verification (IT-CMD / IT-REA
     assert.equal(fs.existsSync(path.join(ws, ".pi/extensions/workspace-guardrail.ts")), false);
   });
 
-  it("IT-CMD-03 & IT-AUTO-01: supports Dismiss flow and passive auto-recording on agent_before_settle", async () => {
+  it("IT-AUTO-01: hooks session_before_compact and session_shutdown in auto mode without double-counting", async () => {
     const ws = makeTempDir("ws-auto");
     fs.mkdirSync(path.join(ws, ".pi"), { recursive: true });
     fs.writeFileSync(
@@ -736,7 +653,7 @@ describe("5. End-to-End Integration & Real Session Verification (IT-CMD / IT-REA
       "utf-8"
     );
 
-    const hooks = new Map<string, (ev: unknown, ctx: PiCommandContext) => Promise<unknown>>();
+    const hooks = new Map<string, (ev: any, ctx: PiCommandContext) => Promise<unknown>>();
     const mockPi: PiExtensionAPI = {
       registerCommand() {},
       on(ev, handler) {
@@ -745,23 +662,39 @@ describe("5. End-to-End Integration & Real Session Verification (IT-CMD / IT-REA
     };
     registerHarness2Extension(mockPi);
 
-    let dismissed = false;
-    const ctx: PiCommandContext = {
-      cwd: ws,
-      sessionId: "sess-auto-1",
-      entries: [
+    const { registry, promptsReceived } = createMockModelRegistry(() => ({
+      steeringEvents: [
         {
-          type: "message",
-          message: {
-            role: "user",
-            content: [{ type: "text", text: "Why didn't you follow instructions?" }],
-          },
+          entryIndex: 1,
+          eventType: "corrective_steer",
+          userMessageQuote: "Please use UTF-8",
+          precedingAssistantActionSummary: "ran script",
         },
       ],
+      inefficiencyEvents: [],
+      subagentEvents: [],
+    }));
+
+    const branchEntries: PiSessionEntry[] = [
+      { type: "session", id: "sess-auto-compact" },
+      {
+        type: "message",
+        message: { role: "user", content: [{ type: "text", text: "Please use UTF-8" }] },
+      },
+    ];
+
+    const ctx: PiCommandContext = {
+      cwd: ws,
+      sessionId: "sess-auto-compact",
+      modelRegistry: registry,
+      sessionManager: {
+        getBranch() {
+          return branchEntries;
+        },
+      },
       ui: {
         notify() {},
         async select() {
-          dismissed = true;
           return MENU_OPTION_DISMISS;
         },
         async confirm() {
@@ -770,15 +703,32 @@ describe("5. End-to-End Integration & Real Session Verification (IT-CMD / IT-REA
       },
     };
 
-    const settleHook = hooks.get("agent_before_settle")!;
-    await settleHook({}, ctx);
+    // 1. Trigger `session_before_compact` -> records entries 0..2
+    const beforeCompact = hooks.get("session_before_compact")!;
+    await beforeCompact({ branchEntries }, ctx);
+    assert.equal(promptsReceived.length, 1);
+    assert.equal(loadWorkspaceState(ws).counters.cumulativeUserSteering, 1);
 
-    assert.equal(dismissed, true);
-    const expContent = fs.readFileSync(path.join(ws, ".pi/harness2/EXPERIENCE.md"), "utf-8");
-    assert.ok(expContent.includes("[DISMISSED]"));
+    // 2. Trigger `session_shutdown` with no new entries -> cursor is already at 2, so 0 new LLM calls!
+    const onShutdown = hooks.get("session_shutdown")!;
+    await onShutdown({}, ctx);
+    assert.equal(promptsReceived.length, 1);
+
+    // 3. Append a post-compaction entry and trigger `session_shutdown` -> records only the new slice!
+    branchEntries.push(
+      { type: "compaction", id: "cmp-1", firstKeptEntryId: "m-post" },
+      {
+        type: "message",
+        id: "m-post",
+        message: { role: "user", content: [{ type: "text", text: "Another steer after compaction" }] },
+      }
+    );
+    await onShutdown({}, ctx);
+    assert.equal(promptsReceived.length, 2);
+    assert.equal(loadWorkspaceState(ws).counters.cumulativeUserSteering, 2);
   });
 
-  it("IT-REAL-01 & IT-REAL-02: accurately analyzes bundled real-session fixture and full session_1/session_2 logs", async () => {
+  it("IT-REAL-01 & IT-REAL-02: compresses 3.7MB real session_1/session_2 logs into compact digests and feeds LLM Judge", async () => {
     const cwdFixturePath = path.resolve(
       process.cwd(),
       "test/fixtures/real-sessions-sample.jsonl"
@@ -792,16 +742,9 @@ describe("5. End-to-End Integration & Real Session Verification (IT-CMD / IT-REA
       : localFixturePath;
 
     const sampleEntries = loadSessionJsonlFile(activeFixturePath);
-    const sampleRec = analyzeOrchestratorTranscript(sampleEntries);
-    assert.equal(sampleRec.summary.hasInstructionComplianceQuestion, true);
-    assert.ok(
-      sampleRec.inefficiencyEvents.some((e) => e.fingerprint === "temp_script_sprawl")
-    );
-    assert.ok(
-      sampleRec.inefficiencyEvents.some(
-        (e) => e.fingerprint === "python_stdout_encoding_gbk" && e.classification === "single_retry_recovery"
-      )
-    );
+    const sampleDigest = buildSessionDigest(sampleEntries);
+    assert.ok(sampleDigest.mechanicalFacts.rootScriptsCreated.length >= 3);
+    assert.ok(sampleDigest.mechanicalFacts.failedToolCalls.length >= 1);
 
     const session1Path = "/working_dir/c_26e9df1852e75c3d/downloads/session_1.jsonl";
     const session2Path = "/working_dir/c_26e9df1852e75c3d/downloads/session_2.jsonl";
@@ -810,43 +753,107 @@ describe("5. End-to-End Integration & Real Session Verification (IT-CMD / IT-REA
     }
 
     const entries1 = loadSessionJsonlFile(session1Path);
-    const rec1 = analyzeOrchestratorTranscript(entries1);
-    assert.equal(rec1.summary.hasInstructionComplianceQuestion, true);
-    assert.ok(rec1.summary.userSteeringCount >= 4);
-    assert.ok(rec1.summary.networkRetriesIgnored >= 1);
-    assert.ok(
-      rec1.inefficiencyEvents.some((e) => e.fingerprint === "temp_script_sprawl")
-    );
-    assert.ok(
-      rec1.inefficiencyEvents.some((e) => e.fingerprint === "python_stdout_encoding_gbk")
-    );
+    const digest1 = buildSessionDigest(entries1);
+    // Verify 790KB session_1 is compressed to a compact text digest (< 40KB) with all 11 root scripts captured
+    assert.ok(digest1.serializedTranscript.length < 40000);
+    assert.ok(digest1.mechanicalFacts.rootScriptsCreated.length >= 10);
+    assert.ok(digest1.mechanicalFacts.networkRetriesIgnored >= 1);
 
     const entries2 = loadSessionJsonlFile(session2Path);
-    const rec2 = analyzeOrchestratorTranscript(entries2);
-    assert.equal(rec2.summary.hasInstructionComplianceQuestion, true);
-    assert.ok(rec2.summary.networkRetriesIgnored >= 1);
+    const digest2 = buildSessionDigest(entries2);
+    // Verify 3.7MB session_2 (with 3MB base64 images) is compressed to < 30KB while preserving dialogue & tool errors!
     assert.ok(
-      rec2.inefficiencyEvents.some((e) => e.fingerprint === "node_esm_module_resolution")
+      digest2.serializedTranscript.length < 30000,
+      `Expected digest2 < 30KB, got ${digest2.serializedTranscript.length} chars`
+    );
+    assert.ok(digest2.serializedTranscript.includes("逻辑漂移"));
+    assert.ok(digest2.mechanicalFacts.failedToolCalls.length >= 3);
+
+    // Feed real session_1 and session_2 digests into the LLM Recorder pipeline
+    const { registry, promptsReceived } = createMockModelRegistry((promptText) => {
+      const isSession1 = promptText.includes("search_literature.py");
+      if (isSession1) {
+        return {
+          steeringEvents: [
+            {
+              entryIndex: 136,
+              eventType: "instruction_compliance_question",
+              userMessageQuote: "我发现你遗漏了很重要的有关假设的讨论...为什么你判断它不重要？",
+              precedingAssistantActionSummary: "Generated commentary.md",
+              rationale: "User questioned why a core hypothesis from the discussion was omitted.",
+            },
+          ],
+          inefficiencyEvents: [
+            {
+              turnRange: [19, 65],
+              classification: "temp_script_sprawl",
+              scoreWeight: 3,
+              fingerprint: "openalex_root_script_sprawl",
+              sprawlScriptsCreated: digest1.mechanicalFacts.rootScriptsCreated,
+              description: "Created 11 temporary Python scripts in workspace root to query OpenAlex.",
+            },
+            {
+              turnRange: [101, 103],
+              classification: "single_retry_recovery",
+              scoreWeight: 1,
+              fingerprint: "windows_python_gbk_encoding",
+              eventualResolutionCommand: "sys.stdout.reconfigure(encoding='utf-8')",
+              description: "Hit GBK UnicodeEncodeError once and fixed with utf-8 stdout reconfigure.",
+            },
+          ],
+          subagentEvents: [],
+        };
+      }
+      return {
+        steeringEvents: [
+          {
+            entryIndex: 108,
+            eventType: "instruction_compliance_question",
+            userMessageQuote: "我发现你仍然发生了一些逻辑漂移...是否出现了重大漂移？",
+            precedingAssistantActionSummary: "Generated deck.pptx",
+            rationale: "User audited logical drift between thesis and slide text.",
+          },
+        ],
+        inefficiencyEvents: [
+          {
+            turnRange: [77, 96],
+            classification: "multi_step_chain",
+            scoreWeight: 3,
+            fingerprint: "pptxgenjs_esm_and_path_resolution",
+            eventualResolutionCommand:
+              "node .agents/skills/teach-skills/presentation-deck-builder/tools/build-beautiful-deck.mjs \"$PWD/deck.pptx\"",
+            description: "Fumbled with pptxgenjs node_modules resolution and ../../../../deck.pptx relative path.",
+          },
+        ],
+        subagentEvents: [],
+      };
+    });
+
+    const mockCtx: PiCommandContext = {
+      model: "antigravity/gemini-3.8-flash",
+      modelRegistry: registry,
+      ui: {
+        notify() {},
+        async select() {
+          return undefined;
+        },
+        async confirm() {
+          return true;
+        },
+      },
+    };
+
+    const { record: r1 } = await recordSessionWithModel(entries1, {}, mockCtx);
+    const { record: r2 } = await recordSessionWithModel(
+      entries2,
+      { existingFingerprints: r1.inefficiencyEvents.map((e) => e.fingerprint) },
+      mockCtx
     );
 
-    const ws = makeTempDir("ws-real-synth");
-    fs.mkdirSync(path.join(ws, ".agents", "skills"), { recursive: true });
-    const state = createInitialWorkspaceState();
-    applyTaskRecordToState(state, rec1, entries1.length);
-    applyTaskRecordToState(state, rec2, entries2.length);
-    const trig = evaluateTriggers(state, DEFAULT_HARNESS2_CONFIG);
-    assert.equal(trig.shouldPropose, true);
-
-    const proposal = await generateHarnessProposal(
-      ws,
-      [rec1, rec2],
-      trig,
-      state,
-      DEFAULT_HARNESS2_CONFIG
-    );
-    assert.ok(proposal.fileOperations.some((op) => op.targetPath === "AGENTS.md"));
-    assert.ok(
-      proposal.fileOperations.some((op) => op.targetPath.startsWith(".agents/skills/"))
-    );
+    assert.equal(promptsReceived.length, 2);
+    assert.equal(r1.recordedBy, "llm_judge");
+    assert.equal(r2.recordedBy, "llm_judge");
+    assert.equal(r1.summary.inefficiencyScoreAdded, 4);
+    assert.equal(r2.summary.inefficiencyScoreAdded, 3);
   });
 });

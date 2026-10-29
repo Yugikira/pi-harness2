@@ -10,6 +10,7 @@ import type {
   WorkspaceHarnessState,
 } from "./types.js";
 import { resolveImproverModel } from "./config.js";
+import { callPiModel } from "./recorder.js";
 
 /**
  * Detects whether the workspace already uses `.agents/skills` (as in session_2.jsonl)
@@ -25,7 +26,7 @@ export function resolveWorkspaceSkillsBaseDir(workspaceDir: string): string {
 }
 
 /**
- * Builds the contrastive Harness² reflection prompt for an LLM improver session.
+ * Builds the contrastive Harness² reflection prompt for the Improver LLM.
  */
 export function buildReflectionPrompt(
   workspaceDir: string,
@@ -48,8 +49,11 @@ export function buildReflectionPrompt(
 
   return [
     "You are the Harness² Workspace Improver for `@earendil-works/pi-coding-agent`.",
-    "Analyze the recorded orchestrator task evidence below and propose concrete, minimal workspace configuration improvements.",
+    "Analyze the LLM-recorded orchestrator task evidence below and propose concrete, minimal workspace configuration improvements.",
     `Target Skills Directory in this workspace: \`${skillsBaseDir}\``,
+    "Allowed target paths: `AGENTS.md`, `.pi/APPEND_SYSTEM.md`, `" +
+      skillsBaseDir +
+      "/<skill-name>/SKILL.md`, `.pi/agents/<agent-name>.md`, `.pi/extensions/<guardrail-name>.ts`.",
     focusHint ? `User Focus Hint: ${focusHint}` : "",
     "",
     "### Trigger Reasons",
@@ -69,6 +73,7 @@ export function buildReflectionPrompt(
     JSON.stringify(
       records.map((r) => ({
         recordId: r.recordId,
+        recordedBy: r.recordedBy,
         summary: r.summary,
         steeringEvents: r.steeringEvents,
         inefficiencyEvents: r.inefficiencyEvents,
@@ -78,16 +83,16 @@ export function buildReflectionPrompt(
       2
     ),
     "",
-    "Return a valid JSON object matching the `HarnessProposal` interface.",
+    "Return ONLY a valid JSON object matching the `HarnessProposal` interface (`diagnosisSummary`, `experienceEntry`, `fileOperations`).",
   ]
     .filter(Boolean)
     .join("\n");
 }
 
 /**
- * Generates an evidence-backed `HarnessProposal` from accumulated `TaskRecord`s.
- * If `ctx.sendMessage` is available and returns valid JSON, uses the LLM response;
- * otherwise synthesizes a deterministic, grounded proposal directly from the recorded evidence.
+ * Generates an evidence-backed `HarnessProposal` from accumulated `TaskRecord`s
+ * using `callPiModel` (`ctx.modelRegistry.complete` / `ctx.completePrompt` / `ctx.sendMessage`),
+ * falling back to deterministic synthesis when offline.
  */
 export async function generateHarnessProposal(
   workspaceDir: string,
@@ -98,19 +103,23 @@ export async function generateHarnessProposal(
   ctx?: PiCommandContext,
   focusHint?: string
 ): Promise<HarnessProposal> {
-  const modelUsed = resolveImproverModel(config, ctx?.model);
+  const activeModelId =
+    typeof ctx?.model === "string" ? ctx.model : ctx?.model?.id;
+  const modelUsed = resolveImproverModel(config, activeModelId);
 
-  if (ctx?.sendMessage) {
-    try {
-      const prompt = buildReflectionPrompt(
-        workspaceDir,
-        records,
-        triggerResult,
-        state,
-        focusHint
-      );
-      const llmResponse = await ctx.sendMessage(prompt, { model: modelUsed });
-      const jsonMatch = llmResponse.match(/\{[\s\S]*\}/);
+  try {
+    const prompt = buildReflectionPrompt(
+      workspaceDir,
+      records,
+      triggerResult,
+      state,
+      focusHint
+    );
+    const llmResult = await callPiModel(prompt, config, ctx);
+    if (llmResult) {
+      const fencedMatch = llmResult.text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      const candidate = fencedMatch ? fencedMatch[1] : llmResult.text;
+      const jsonMatch = candidate.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]) as HarnessProposal;
         if (
@@ -123,14 +132,14 @@ export async function generateHarnessProposal(
             ...parsed,
             proposalId: parsed.proposalId || `prop-${Date.now()}`,
             createdAt: new Date().toISOString(),
-            modelUsed,
+            modelUsed: llmResult.modelUsed,
             triggerReasons: triggerResult.reasons,
           };
         }
       }
-    } catch {
-      // Fall back to deterministic synthesis when LLM call fails or is unavailable
     }
+  } catch {
+    // Fall back to deterministic synthesis when offline
   }
 
   return synthesizeDeterministicProposal(
@@ -143,9 +152,7 @@ export async function generateHarnessProposal(
 }
 
 /**
- * Deterministic evidence-based proposal synthesizer.
- * Inspects recorded steering events, tool inefficiency fingerprints, temp script sprawl,
- * and subagent revisions to generate ready-to-apply workspace files (`AGENTS.md`, `.pi/skills/`, `.pi/agents/`, `.pi/extensions/`).
+ * Offline fallback synthesizer used when no live LLM is connected during unit tests.
  */
 export function synthesizeDeterministicProposal(
   workspaceDir: string,
@@ -164,135 +171,51 @@ export function synthesizeDeterministicProposal(
   const allInefficiencies = records.flatMap((r) => r.inefficiencyEvents);
   const allSubagents = records.flatMap((r) => r.subagentEvents);
 
-  // 1. Handle Tool Inefficiency & Temp Script Sprawl -> Generate Skill(s) & Tool Guidance
-  const hasOpenAlexOrSprawl = allInefficiencies.some(
-    (e) =>
-      e.fingerprint === "temp_script_sprawl" ||
-      e.fingerprint === "network_or_api_query_error"
-  );
-  const hasPptxResolutionError = allInefficiencies.some(
-    (e) =>
-      e.fingerprint === "node_esm_module_resolution" ||
-      e.toolsInvoked.some((t) => /pptxgenjs|export-pptx/i.test(t.inputSummary))
-  );
-  const hasGbkEncodingError = allInefficiencies.some(
-    (e) => e.fingerprint === "python_stdout_encoding_gbk"
-  );
-
-  if (hasOpenAlexOrSprawl) {
-    const sprawlEv = allInefficiencies.find(
-      (e) => e.fingerprint === "temp_script_sprawl"
-    );
-    if (sprawlEv) {
-      evidenceQuotes.push(sprawlEv.description);
-    }
-    lessons.push(
-      "Avoid creating multiple one-off Python scripts in the workspace root for literature searches; use a single reusable CLI skill with UTF-8 stdout encoding."
-    );
-    fileOperations.push({
-      targetPath: `${skillsBase}/literature-search/SKILL.md`,
-      operation: "create",
-      componentType: "skill",
-      rationale:
-        "Replaces ad-hoc root Python scripts and failed OpenAlex filter queries with a single reusable skill.",
-      fullNewContent: [
-        "---",
-        "name: literature-search",
-        "description: Query OpenAlex API for academic literature with proper UTF-8 encoding and clean temporary file handling.",
-        "---",
-        "",
-        "# OpenAlex Literature Search Skill",
-        "",
-        "## Rules",
-        "1. **Never** litter the workspace root with temporary `search_*.py` scripts.",
-        "2. Always configure UTF-8 output on Windows (`sys.stdout.reconfigure(encoding='utf-8')`).",
-        "3. Use the bundled helper script or clean up any scratch file immediately after execution.",
-        "",
-        "## Working Command Pattern",
-        "```bash",
-        "python -c \"import sys, urllib.request, urllib.parse, json; sys.stdout.reconfigure(encoding='utf-8'); url='https://api.openalex.org/works?per_page=5&sort=cited_by_count:desc&search=' + urllib.parse.quote('YOUR_QUERY'); print(json.dumps(json.loads(urllib.request.urlopen(url, timeout=15).read()), ensure_ascii=False)[:2000])\"",
-        "```",
-        "",
-      ].join("\n"),
-    });
-  }
-
-  if (hasPptxResolutionError) {
-    const pptxEv = allInefficiencies.find(
-      (e) => e.fingerprint === "node_esm_module_resolution"
-    );
-    if (pptxEv) {
-      evidenceQuotes.push(pptxEv.description);
-    }
-    lessons.push(
-      "When running ESM presentation scripts that depend on local node_modules, pass an absolute output path (`$PWD/deck.pptx`) and resolve modules from the skill's `tools/` directory."
-    );
-    fileOperations.push({
-      targetPath: `${skillsBase}/pptx-builder-helper/SKILL.md`,
-      operation: "create",
-      componentType: "skill",
-      rationale:
-        "Encapsulates the working ESM module resolution and absolute output path recipe for `pptxgenjs` / `export-pptx.mjs`.",
-      fullNewContent: [
-        "---",
-        "name: pptx-builder-helper",
-        "description: Build PowerPoint (.pptx) decks cleanly using the presentation-deck-builder tools without ESM module resolution or relative path errors.",
-        "---",
-        "",
-        "# PPTX Builder Execution Guide",
-        "",
-        "## Verified Commands",
-        "- To export from `deck.json`:",
-        "  ```bash",
-        "  node .agents/skills/teach-skills/presentation-deck-builder/tools/export-pptx.mjs --input deck.json --output \"$PWD/deck.pptx\"",
-        "  ```",
-        "- When running custom `pptxgenjs` builder scripts located inside `.agents/skills/teach-skills/presentation-deck-builder/tools/`, always pass `\"$PWD/deck.pptx\"` as the output path rather than `../../../../deck.pptx` so the output lands in the workspace root.",
-        "",
-      ].join("\n"),
-    });
-  }
-
-  if (
-    !hasOpenAlexOrSprawl &&
-    !hasPptxResolutionError &&
-    allInefficiencies.length > 0
-  ) {
-    const topEv = allInefficiencies[allInefficiencies.length - 1];
-    evidenceQuotes.push(topEv.description);
+  // 1. Handle Tool InefficiencyEvents -> Generate Skill(s)
+  for (const ev of allInefficiencies.slice(-2)) {
+    evidenceQuotes.push(ev.description);
+    const skillSlug = (ev.fingerprint || "workflow-helper")
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, "-")
+      .replace(/^-+|-+$/g, "");
     const workingCmd =
-      topEv.eventualResolutionCommand ??
-      topEv.toolsInvoked[topEv.toolsInvoked.length - 1]?.inputSummary ??
-      "echo 'Verified workflow'";
-    const skillSlug = topEv.fingerprint.replace(/_/g, "-");
+      ev.eventualResolutionCommand ??
+      (ev.sprawlScriptsCreated?.length
+        ? `# Consolidate scripts: ${ev.sprawlScriptsCreated.join(", ")}`
+        : "echo 'Verified workflow'");
+
     lessons.push(
-      `Standardize [${topEv.fingerprint}] workflow into a skill so the agent uses \`${workingCmd}\` on the first attempt.`
+      `Standardize [${ev.fingerprint}] into \`${skillsBase}/${skillSlug}/SKILL.md\` to prevent repeated ${ev.classification}.`
     );
-    fileOperations.push({
-      targetPath: `${skillsBase}/${skillSlug}/SKILL.md`,
-      operation: "create",
-      componentType: "skill",
-      rationale: `Extracted from recorded tool inefficiency (${topEv.classification}) on [${topEv.fingerprint}].`,
-      fullNewContent: [
-        "---",
-        `name: ${skillSlug}`,
-        `description: Verified workflow to avoid ${topEv.fingerprint} errors in this workspace.`,
-        "---",
-        "",
-        `# ${skillSlug} Workflow`,
-        "",
-        "## Observed Issue",
-        topEv.description,
-        "",
-        "## Verified Resolution Command",
-        "```bash",
-        workingCmd,
-        "```",
-        "",
-      ].join("\n"),
-    });
+
+    if (!fileOperations.some((op) => op.targetPath === `${skillsBase}/${skillSlug}/SKILL.md`)) {
+      fileOperations.push({
+        targetPath: `${skillsBase}/${skillSlug}/SKILL.md`,
+        operation: "create",
+        componentType: "skill",
+        rationale: `Extracted from recorded tool inefficiency (${ev.classification}) on [${ev.fingerprint}].`,
+        fullNewContent: [
+          "---",
+          `name: ${skillSlug}`,
+          `description: Workspace skill addressing ${ev.fingerprint} (${ev.classification}).`,
+          "---",
+          "",
+          `# ${skillSlug}`,
+          "",
+          "## Observed Issue",
+          ev.description,
+          "",
+          "## Verified Resolution",
+          "```bash",
+          workingCmd,
+          "```",
+          "",
+        ].join("\n"),
+      });
+    }
   }
 
-  // 2. Handle Subagent Revisions -> Generate/Update `.pi/agents/<role>.md` Profile
+  // 2. Handle Subagent Revisions -> Generate/Update `.pi/agents/<role>.md`
   if (allSubagents.length > 0) {
     const subEv = allSubagents[allSubagents.length - 1];
     const roleName = subEv.agentProfile ?? subEv.subagentName ?? "worker";
@@ -300,7 +223,7 @@ export function synthesizeDeterministicProposal(
       `Subagent '${subEv.subagentName}' (${subEv.outcomeSignal}): ${subEv.revisedFiles.join(", ") || subEv.followUpMessages.join(" | ")}`
     );
     lessons.push(
-      `Refine subagent profile '.pi/agents/${roleName}.md' with explicit deliverable verification and scope constraints so the orchestrator does not need to rewrite its output.`
+      `Refine subagent profile '.pi/agents/${roleName}.md' with explicit deliverable verification.`
     );
     fileOperations.push({
       targetPath: `.pi/agents/${roleName}.md`,
@@ -331,7 +254,7 @@ export function synthesizeDeterministicProposal(
     });
   }
 
-  // 3. Handle Explicit Instruction-Violation Queries -> Add Project-Level Guardrail Extension if destructive/command violation
+  // 3. Handle Destructive Command Violations -> Project-level Guardrail Extension
   const instructionQuestions = allSteering.filter(
     (s) => s.eventType === "instruction_compliance_question"
   );
@@ -365,64 +288,42 @@ export function synthesizeDeterministicProposal(
     });
   }
 
-  // 4. Always Update or Create `AGENTS.md` with Distilled Workspace Rules (Steering + Encoding + Domain Fidelity)
+  // 4. Update or Create `AGENTS.md`
   const agentsMdPath = path.join(workspaceDir, "AGENTS.md");
   const existingAgentsContent = fs.existsSync(agentsMdPath)
     ? fs.readFileSync(agentsMdPath, "utf-8")
     : "# Workspace Agent Instructions (AGENTS.md)\n";
 
   const newRules: string[] = [];
-  if (hasGbkEncodingError) {
-    newRules.push(
-      "- **Windows Python UTF-8 Output**: Always include `import sys; sys.stdout.reconfigure(encoding='utf-8')` when running inline `python -c` or scripts on Windows to avoid `gbk` `UnicodeEncodeError`."
-    );
-  }
   for (const steer of allSteering.slice(-4)) {
     evidenceQuotes.push(`User (${steer.eventType}): "${steer.userMessageQuote.slice(0, 140)}"`);
-    if (/遗漏|潜在假设|逻辑漂移/.test(steer.userMessageQuote)) {
-      newRules.push(
-        "- **Strict Premise & Thesis Fidelity**: Before generating or revising `commentary.md`, `deck.pptx`, or `lecture-notes.md`, explicitly cross-check every core premise (e.g., incremental impact of LLMs over prior RPA/automation vs. direct LLM skill demand inversion) so no discussed hypothesis is omitted or drifts."
-      );
-    } else if (/不要添加这种主标题|be humble|AI-slop/i.test(steer.userMessageQuote)) {
-      newRules.push(
-        "- **Academic Tone & Slide Titles**: Use the paper title directly as the Slide 1 main title (avoid self-congratulatory labels like '特邀学术点评'), maintain a humble scholarly tone, and eliminate AI-slop phrasing."
-      );
-    } else if (/清除.*python脚本/.test(steer.userMessageQuote)) {
-      newRules.push(
-        "- **Workspace Hygiene**: Never leave temporary one-off `.py` helper scripts in the project root after completing literature or data lookups."
-      );
-    } else {
-      newRules.push(
-        `- **Recorded User Preference**: Respect user guidance — "${steer.userMessageQuote.replace(/\r?\n/g, " ").slice(0, 120)}"`
-      );
-    }
+    newRules.push(
+      `- **Recorded Workspace Guideline (${steer.eventType})**: ${steer.rationale ?? steer.userMessageQuote.replace(/\r?\n/g, " ").slice(0, 140)}`
+    );
   }
-
   if (focusHint) {
     newRules.push(`- **User Focus Rule**: ${focusHint}`);
   }
+  if (newRules.length === 0) {
+    newRules.push(
+      "- **Workspace Verification**: Follow generated workspace skills and verify tool arguments before execution."
+    );
+  }
 
   const deduplicatedRules = Array.from(new Set(newRules));
-  if (deduplicatedRules.length > 0 || fileOperations.length === 0) {
-    if (deduplicatedRules.length === 0) {
-      deduplicatedRules.push(
-        "- **Workspace Verification**: Verify command flags and file paths before executing multi-step tool chains."
-      );
-    }
-    const sectionHeader = "\n\n## Harness² Self-Improvement Guidelines\n";
-    const updatedAgentsMd = existingAgentsContent.includes("## Harness² Self-Improvement Guidelines")
-      ? `${existingAgentsContent.trimEnd()}\n${deduplicatedRules.join("\n")}\n`
-      : `${existingAgentsContent.trimEnd()}${sectionHeader}${deduplicatedRules.join("\n")}\n`;
+  const sectionHeader = "\n\n## Harness² Self-Improvement Guidelines\n";
+  const updatedAgentsMd = existingAgentsContent.includes("## Harness² Self-Improvement Guidelines")
+    ? `${existingAgentsContent.trimEnd()}\n${deduplicatedRules.join("\n")}\n`
+    : `${existingAgentsContent.trimEnd()}${sectionHeader}${deduplicatedRules.join("\n")}\n`;
 
-    fileOperations.push({
-      targetPath: "AGENTS.md",
-      operation: fs.existsSync(agentsMdPath) ? "update" : "create",
-      componentType: "agents_md",
-      rationale:
-        "Codifies recurring user steering corrections, domain premises, and environment rules directly into project-root `AGENTS.md`.",
-      fullNewContent: updatedAgentsMd,
-    });
-  }
+  fileOperations.push({
+    targetPath: "AGENTS.md",
+    operation: fs.existsSync(agentsMdPath) ? "update" : "create",
+    componentType: "agents_md",
+    rationale:
+      "Codifies LLM-identified user steering corrections and domain rules into project-root `AGENTS.md`.",
+    fullNewContent: updatedAgentsMd,
+  });
 
   const diagnosisSummary = [
     `Triggered by: ${triggerResult.humanReadableReasons.join(" ")}`,
@@ -442,7 +343,7 @@ export function synthesizeDeterministicProposal(
       evidenceQuotes: evidenceQuotes.slice(0, 6),
       lessonLearned:
         lessons.join(" ") ||
-        "Codified user corrections and tool workflow improvements into workspace configuration.",
+        "Codified LLM-judged user corrections and tool workflow improvements into workspace configuration.",
     },
     fileOperations,
   };

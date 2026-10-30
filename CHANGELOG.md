@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-10-30
+
+### Fixed
+- **Strict TypeScript Compilation & Chained Type Assertion Stripping**:
+  - Updated `scripts/run-tests.mjs` to strip chained `as` type assertions (`as unknown as Type`) and relaxed method parameter annotations in `test/harness2.test.ts`.
+  - Added runtime normalization for LLM-returned `steeringEvents`, `inefficiencyEvents` (clamping `scoreWeight > 0` and trimming underscores from `fingerprint`), and `subagentEvents` in `recordSessionWithModel` (`src/recorder.ts`), and preserved explicit `userNote` strings passed to `/harness2 record`.
+- **Zero-Entry Lifecycle & Inactive Session Short-Circuits**:
+  - Short-circuited `handleRecordAndCheck` (`src/index.ts`) and `recordSessionWithModel` (`src/recorder.ts`) when `entries.length <= startIndex && !userNote`, avoiding redundant LLM calls and empty record files when `/harness2 record` is run with zero new turns.
+  - Updated `/harness2 propose` ad-hoc recording (`src/index.ts`) to respect `state.sessionCursors[sessionId]` and persist state via `applyTaskRecordToState` and `saveWorkspaceState`.
+- **Target Path Security, Recursive Cleanup & Cursor Persistence**:
+  - Hardened `validateTargetPath` (`src/applier.ts`) to disallow `.pi/harness2/**` internal state paths and directory-only paths, and deduplicated `fileOperations` by `normalizedPath`.
+  - Added deepest-first empty directory cleanup and snooze watermark reset on `/harness2 undo`.
+  - Updated `loadRecentTaskRecords` (`src/triggers.ts`) to scan all current-cycle records before slicing to `limit` so empty session records cannot push out friction records.
+- **Stage 1 Digest, Path Safety & Improver Context**:
+  - Fixed `buildSessionDigest` (`src/analyzer.ts`) to strip `./` prefixes when detecting `rootScriptsCreated`, attribute `hadChildErrorExit` to the specific subagent in `pending.args`, and only mark retracted turns on `entry.replacement === null`.
+  - Enriched `buildReflectionPrompt` (`src/improver.ts`) with `.pi/APPEND_SYSTEM.md`, existing workspace skill/subagent/extension inventories, `fingerprintCounts`, and `dismissedProposalSummaries`.
+  - Updated `docs/pi-harness2-prd.md` to align with the complete v0.3.3 specification.
+
 ## [0.3.2] - 2026-10-29
 
 ### Fixed

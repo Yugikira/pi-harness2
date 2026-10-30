@@ -212,7 +212,7 @@ function stripTypeScriptTypes(source) {
   code = stripGenericConstructorCalls(code);
   code = stripFunctionSignatures(code);
   code = code.replace(/^(\s*(?:export\s+)?(?:const|let|var)\s+[A-Za-z0-9_]+)\s*:\s*[^\n=]+?(\s*=|\s*;\s*$)/gm, "$1$2");
-  code = code.replace(/\s+as\s+[A-Za-z0-9_]+(?:<[^>;)\n]+>)?(?:\[\])?(?:\["[A-Za-z0-9_]+"])?(?=[,;)\]\n])/g, "");
+  code = code.replace(/(?:\s+as\s+[A-Za-z0-9_]+(?:<[^>;)\n]+>)?(?:\[\])?(?:\["[A-Za-z0-9_]+"])*)+(?=[,;)\]\n])/g, "");
   code = code.replace(/([A-Za-z0-9_)\]])!(?=[.,;)\]\s])/g, "$1");
   return code;
 }

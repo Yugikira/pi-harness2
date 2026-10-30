@@ -1,6 +1,6 @@
 # Technical & Test Specification: `pi-harness2` Workspace Self-Improvement Extension
 
-- **Document Version:** 0.3.2  
+- **Document Version:** 0.3.3  
 - **Date:** October 29, 2026  
 - **Companion Document:** `pi-harness2-prd.md`  
 - **Host Runtime:** [@earendil-works/pi-coding-agent](https://github.com/earendil-works/pi) (`Node.js >= 22.19`, TypeScript Extension API)  

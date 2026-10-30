@@ -16,8 +16,6 @@ import {
   resolveFullUncompactedEntries,
 } from "../src/analyzer.js";
 import {
-  buildRecordFromMechanicalFacts,
-  buildRecorderPrompt,
   recordSessionWithModel,
 } from "../src/recorder.js";
 import {
@@ -28,7 +26,6 @@ import {
   loadWorkspaceState,
   saveTaskRecord,
   saveWorkspaceState,
-  snoozeProposalForOneSession,
 } from "../src/triggers.js";
 import {
   UnauthorizedTargetPathError,
@@ -38,7 +35,6 @@ import {
   validateTargetPath,
 } from "../src/applier.js";
 import {
-  generateHarnessProposal,
   normalizeHarnessProposal,
 } from "../src/improver.js";
 import {
@@ -55,6 +51,8 @@ import type {
   PiExtensionAPI,
   PiModelRegistry,
   PiSessionEntry,
+  TaskRecord,
+  TriggerEvaluationResult,
 } from "../src/types.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -375,14 +373,14 @@ describe("2. Stage 1 — Uncompacted Session Digest & Mechanical Facts (UT-DIG)"
     assert.equal(repeatMatches.length, 2);
   });
 
-  it("UT-DIG-03: extracts mechanical facts for root script sprawl, failed tool calls, and subagent file revisions", () => {
+  it("UT-DIG-03: extracts mechanical facts for root script sprawl (including ./ prefix), failed tool calls, and subagent file revisions", () => {
     const entries: PiSessionEntry[] = [
       {
         type: "message",
         message: {
           role: "assistant",
           content: [
-            { type: "toolCall", id: "w1", name: "write", arguments: { path: "s1.py", content: "1" } },
+            { type: "toolCall", id: "w1", name: "write", arguments: { path: "./s1.py", content: "1" } },
             { type: "toolCall", id: "w2", name: "write", arguments: { path: "s2.py", content: "2" } },
             { type: "toolCall", id: "w3", name: "write", arguments: { path: "s3.py", content: "3" } },
             {
@@ -552,12 +550,19 @@ describe("3. Stage 2 — AI Model Semantic Recorder & Cross-Task Fingerprinting 
 });
 
 describe("4. Atomic File Applier, Path Safety & Undo (UT-APP)", () => {
-  it("UT-APP-01: blocks path traversal and unauthorized application source files", () => {
+  it("UT-APP-01: blocks path traversal, internal .pi/harness2 state files, directory-only paths, and unauthorized application source files", () => {
     const ws = makeTempDir("ws-security");
     assert.throws(() => validateTargetPath(ws, "../../etc/passwd"), UnauthorizedTargetPathError);
     assert.throws(() => validateTargetPath(ws, "src/index.ts"), UnauthorizedTargetPathError);
+    assert.throws(() => validateTargetPath(ws, ".pi/harness2/state.json"), UnauthorizedTargetPathError);
+    assert.throws(() => validateTargetPath(ws, ".pi/skills/my-skill/"), UnauthorizedTargetPathError);
+    assert.throws(() => validateTargetPath(ws, ".pi/skills/./my-skill/SKILL.md"), UnauthorizedTargetPathError);
     assert.equal(validateTargetPath(ws, "AGENTS.md"), "AGENTS.md");
     assert.equal(validateTargetPath(ws, ".pi/skills/my-skill/SKILL.md"), ".pi/skills/my-skill/SKILL.md");
+    assert.equal(
+      validateTargetPath(ws, ".pi/skills/my-skill/scripts/normalize.py"),
+      ".pi/skills/my-skill/scripts/normalize.py"
+    );
     assert.equal(validateTargetPath(ws, ".agents/skills/my-skill/SKILL.md"), ".agents/skills/my-skill/SKILL.md");
     assert.equal(validateTargetPath(ws, ".pi/agents/scout.md"), ".pi/agents/scout.md");
     assert.equal(validateTargetPath(ws, ".pi/extensions/guard.ts"), ".pi/extensions/guard.ts");
@@ -600,18 +605,27 @@ describe("4. Atomic File Applier, Path Safety & Undo (UT-APP)", () => {
           rationale: "New skill",
           fullNewContent: "---\nname: csv-helper\ndescription: test\n---\n# Body\n",
         },
+        {
+          targetPath: ".pi/skills/csv-helper/scripts/norm.py",
+          operation: "create",
+          componentType: "script",
+          rationale: "New helper script",
+          fullNewContent: "print('ok')\n",
+        },
       ],
     };
 
     applyHarnessProposal(ws, proposal);
     assert.ok(fs.readFileSync(path.join(ws, "AGENTS.md"), "utf-8").includes("## New Section"));
     assert.ok(fs.existsSync(path.join(ws, ".pi/skills/csv-helper/SKILL.md")));
+    assert.ok(fs.existsSync(path.join(ws, ".pi/skills/csv-helper/scripts/norm.py")));
     assert.notEqual(loadWorkspaceState(ws).lastProposalAppliedAt, priorCycleTimestamp);
 
     const undoRes = undoLatestProposal(ws);
     assert.equal(undoRes.reverted, true);
     assert.equal(fs.readFileSync(path.join(ws, "AGENTS.md"), "utf-8"), originalAgents);
     assert.equal(fs.existsSync(path.join(ws, ".pi/skills/csv-helper/SKILL.md")), false);
+    assert.equal(fs.existsSync(path.join(ws, ".pi/skills/csv-helper")), false);
     const restoredState = loadWorkspaceState(ws);
     assert.equal(restoredState.counters.cumulativeUserSteering, 3);
     assert.equal(restoredState.lastProposalAppliedAt, priorCycleTimestamp);
@@ -619,7 +633,7 @@ describe("4. Atomic File Applier, Path Safety & Undo (UT-APP)", () => {
 });
 
 describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CMD / IT-REAL)", () => {
-  it("IT-CMD-01 & IT-CMD-02: executes /harness2 record with LLM Judge -> Preview -> Apply -> Undo", async () => {
+  it("IT-CMD-01 & IT-CMD-02: executes /harness2 record with LLM Judge -> Preview -> Apply -> Undo, and skips LLM when 0 new entries", async () => {
     const ws = makeTempDir("ws-e2e");
     const commands = new Map<string, (args: string, ctx: PiCommandContext) => Promise<void>>();
     const hooks = new Map<string, (ev: any, ctx: PiCommandContext) => Promise<unknown>>();
@@ -640,7 +654,7 @@ describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CM
     assert.ok(hooks.has("session_shutdown"));
 
     let callIdx = 0;
-    const { registry } = createMockModelRegistry(() => {
+    const { registry, promptsReceived } = createMockModelRegistry(() => {
       callIdx += 1;
       if (callIdx === 1) {
         // Call 1: Stage 2 Recorder LLM output
@@ -717,8 +731,13 @@ describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CM
     await handler("record", ctx);
 
     assert.equal(selectCallCount, 2);
+    assert.equal(promptsReceived.length, 2);
     assert.ok(fs.existsSync(path.join(ws, "AGENTS.md")));
     assert.ok(fs.existsSync(path.join(ws, ".pi/extensions/workspace-guardrail.ts")));
+
+    // Running /harness2 record again with no new entries should NOT invoke the LLM
+    await handler("record", ctx);
+    assert.equal(promptsReceived.length, 2);
 
     await handler("undo", ctx);
     assert.equal(fs.existsSync(path.join(ws, ".pi/extensions/workspace-guardrail.ts")), false);
@@ -833,6 +852,47 @@ describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CM
     const session1Path = "/working_dir/c_26e9df1852e75c3d/downloads/session_1.jsonl";
     const session2Path = "/working_dir/c_26e9df1852e75c3d/downloads/session_2.jsonl";
     if (!fs.existsSync(session1Path) || !fs.existsSync(session2Path)) {
+      const { registry: sampleRegistry, promptsReceived: samplePrompts } = createMockModelRegistry(() => ({
+        steeringEvents: [
+          {
+            entryIndex: 12,
+            eventType: "instruction_compliance_question",
+            userMessageQuote: "Why didn't you follow the instructions in AGENTS.md?",
+            precedingAssistantActionSummary: "ran script1.py",
+          },
+        ],
+        inefficiencyEvents: [
+          {
+            turnRange: [2, 7],
+            classification: "temp_script_sprawl",
+            scoreWeight: 3,
+            fingerprint: "root_script_sprawl",
+            sprawlScriptsCreated: sampleDigest.mechanicalFacts.rootScriptsCreated,
+            description: "Created 3 temporary Python scripts in workspace root.",
+          },
+        ],
+        subagentEvents: [],
+      }));
+      const { record: sampleRec } = await recordSessionWithModel(
+        sampleEntries,
+        {},
+        {
+          model: "antigravity/gemini-3.8-flash",
+          modelRegistry: sampleRegistry,
+          ui: {
+            notify() {},
+            async select() {
+              return undefined;
+            },
+            async confirm() {
+              return true;
+            },
+          },
+        }
+      );
+      assert.equal(samplePrompts.length, 1);
+      assert.equal(sampleRec.recordedBy, "llm_judge");
+      assert.equal(sampleRec.summary.inefficiencyScoreAdded, 3);
       return;
     }
 
@@ -964,13 +1024,13 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
       ],
     };
 
-    const triggerResult = {
+    const triggerResult: TriggerEvaluationResult = {
       shouldPropose: true,
       reasons: ["TOOL_INEFFICIENCY_SCORE_THRESHOLD"],
       humanReadableReasons: ["Accumulated tool inefficiency score of 3."],
     };
 
-    const mockRecords = [
+    const mockRecords: TaskRecord[] = [
       {
         recordId: "rec-1",
         sessionId: "sess-1",
@@ -1050,7 +1110,7 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
       triggerReasons: ["MANUAL_FORCE_PROPOSE"],
       diagnosisSummary: "Raw partial test",
       fileOperations: [],
-    };
+    } as unknown as HarnessProposal;
     const safeCard = formatProposalCard(rawPartialProposal);
     assert.ok(safeCard.includes("prop-raw-test"));
     const safePreview = formatProposalPreview(rawPartialProposal);
@@ -1110,12 +1170,13 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
       });
     }
 
-    // Now save 5 empty session records (e.g. user started Pi and quit without doing anything)
-    for (let i = 3; i <= 7; i++) {
+    // Now save 25 empty session records (e.g. user started Pi and quit without doing anything)
+    for (let i = 3; i <= 27; i++) {
+      const padded = String(i).padStart(2, "0");
       saveTaskRecord(ws, {
         recordId: `rec-empty-${i}`,
         sessionId: `sess-${i}`,
-        timestamp: `2026-10-29T11:0${i}:00.000Z`,
+        timestamp: `2026-10-29T11:${padded}:00.000Z`,
         workspacePath: ws,
         recordedBy: "mechanical_fallback",
         summary: {
@@ -1136,7 +1197,7 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
     }
 
     const loaded = loadRecentTaskRecords(ws, 5);
-    // Should prioritize the friction-containing records
+    // Should prioritize the friction-containing records even when >20 empty records follow
     assert.ok(loaded.some((r) => r.recordId.startsWith("rec-friction-")));
     assert.ok(loaded.some((r) => r.steeringEvents.length > 0));
   });
@@ -1186,8 +1247,8 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
       subagentEvents: [],
     });
 
-    const hooks = new Map();
-    const mockPi = {
+    const hooks = new Map<string, (ev: any, ctx: PiCommandContext) => Promise<unknown>>();
+    const mockPi: PiExtensionAPI = {
       registerCommand() {},
       on(ev, handler) {
         hooks.set(ev, handler);
@@ -1198,12 +1259,12 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
     // Scenario 1: User starts session and selects "Not now (snooze for 1 session)"
     let selectPromptCount = 0;
     let selectPromptText = "";
-    const ctxSnooze = {
+    const ctxSnooze: PiCommandContext = {
       cwd: ws,
       sessionId: "sess-new-1",
       ui: {
         notify() {},
-        async select(prompt, options) {
+        async select(prompt, _options) {
           selectPromptCount += 1;
           selectPromptText = prompt;
           return "2. Not now (snooze for 1 session)";
@@ -1214,7 +1275,7 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
       },
     };
 
-    const sessionStartHook = hooks.get("session_start");
+    const sessionStartHook = hooks.get("session_start")!;
     assert.ok(sessionStartHook);
 
     await sessionStartHook({}, ctxSnooze);
@@ -1247,12 +1308,12 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
     saveWorkspaceState(ws, snoozedState);
 
     let proposalReviewed = false;
-    const ctxReview = {
+    const ctxReview: PiCommandContext = {
       cwd: ws,
       sessionId: "sess-new-2",
       ui: {
         notify() {},
-        async select(prompt, options) {
+        async select(prompt, _options) {
           if (prompt.includes("Review improvement proposal now")) {
             return "1. Review improvement proposal now";
           }
@@ -1272,7 +1333,7 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
     assert.equal(proposalReviewed, true);
   });
 
-  it("UT-NORM-03: loadRecentTaskRecords strictly scopes to current cycle and returns [] when no records exist after lastProposalAppliedAt", () => {
+  it("UT-NORM-03: loadRecentTaskRecords strictly scopes to current cycle and /harness2 propose respects sessionCursors", async () => {
     const ws = makeTempDir("ws-cycle-boundary");
 
     // Old cycle: record created at 10:00

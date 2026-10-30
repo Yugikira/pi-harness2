@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
+  EditableComponentType,
   Harness2Config,
   HarnessProposal,
   PiCommandContext,
@@ -26,6 +27,15 @@ export function resolveWorkspaceSkillsBaseDir(workspaceDir: string): string {
   return ".pi/skills";
 }
 
+function listWorkspaceAssetsSafe(dirPath: string): string[] {
+  try {
+    if (!fs.existsSync(dirPath)) return [];
+    return fs.readdirSync(dirPath).slice(0, 30);
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Builds the contrastive Harness² reflection prompt for the Improver LLM.
  */
@@ -41,12 +51,33 @@ export function buildReflectionPrompt(
     ? fs.readFileSync(agentsMdPath, "utf-8").slice(0, 3000)
     : "(No AGENTS.md present yet)";
 
+  const appendSystemPath = path.join(workspaceDir, ".pi", "APPEND_SYSTEM.md");
+  const existingAppendSystem = fs.existsSync(appendSystemPath)
+    ? fs.readFileSync(appendSystemPath, "utf-8").slice(0, 1500)
+    : "(No .pi/APPEND_SYSTEM.md present yet)";
+
   const experiencePath = path.join(workspaceDir, ".pi", "harness2", "EXPERIENCE.md");
   const existingExperience = fs.existsSync(experiencePath)
     ? fs.readFileSync(experiencePath, "utf-8").slice(-2000)
     : "(No prior EXPERIENCE.md entries)";
 
   const skillsBaseDir = resolveWorkspaceSkillsBaseDir(workspaceDir);
+  const existingSkills = listWorkspaceAssetsSafe(path.join(workspaceDir, skillsBaseDir));
+  const existingAgents = listWorkspaceAssetsSafe(path.join(workspaceDir, ".pi", "agents"));
+  const existingExtensions = listWorkspaceAssetsSafe(path.join(workspaceDir, ".pi", "extensions"));
+
+  const fingerprintSummary = Object.entries(state.counters?.fingerprintCounts ?? {})
+    .map(([fp, count]) => `${fp} (${count} task(s))`)
+    .join(", ");
+
+  const dismissedSection =
+    state.dismissedProposalSummaries && state.dismissedProposalSummaries.length > 0
+      ? [
+          "### Previously Dismissed Proposals (Avoid repeating these)",
+          ...state.dismissedProposalSummaries.slice(-5).map((s) => `- ${s}`),
+          "",
+        ].join("\n")
+      : "";
 
   return [
     "You are the Harness² Workspace Improver for `@earendil-works/pi-coding-agent`.",
@@ -54,15 +85,28 @@ export function buildReflectionPrompt(
     `Target Skills Directory in this workspace: \`${skillsBaseDir}\``,
     "Allowed target paths: `AGENTS.md`, `.pi/APPEND_SYSTEM.md`, `" +
       skillsBaseDir +
-      "/<skill-name>/SKILL.md`, `.pi/agents/<agent-name>.md`, `.pi/extensions/<guardrail-name>.ts`.",
+      "/<skill-name>/SKILL.md`, `" +
+      skillsBaseDir +
+      "/<skill-name>/scripts/<script-name>`, `.pi/agents/<agent-name>.md`, `.pi/extensions/<guardrail-name>.ts`.",
     focusHint ? `User Focus Hint: ${focusHint}` : "",
     "",
     "### Trigger Reasons",
     ...triggerResult.humanReadableReasons.map((r) => `- ${r}`),
+    fingerprintSummary ? `- Workspace Fingerprint Counts: ${fingerprintSummary}` : "",
+    "",
+    "### Existing Workspace Assets",
+    `- Skills (${skillsBaseDir}): ${existingSkills.length > 0 ? existingSkills.join(", ") : "(none)"}`,
+    `- Subagents (.pi/agents): ${existingAgents.length > 0 ? existingAgents.join(", ") : "(none)"}`,
+    `- Guardrail Extensions (.pi/extensions): ${existingExtensions.length > 0 ? existingExtensions.join(", ") : "(none)"}`,
     "",
     "### Existing AGENTS.md",
     "```markdown",
     existingAgentsMd,
+    "```",
+    "",
+    "### Existing .pi/APPEND_SYSTEM.md",
+    "```markdown",
+    existingAppendSystem,
     "```",
     "",
     "### Existing EXPERIENCE.md (Recent Lessons)",
@@ -70,6 +114,7 @@ export function buildReflectionPrompt(
     existingExperience,
     "```",
     "",
+    dismissedSection,
     "### Recorded Task Evidence",
     JSON.stringify(
       records.map((r) => ({
@@ -131,15 +176,17 @@ export function normalizeHarnessProposal(
   workspaceDir?: string
 ): HarnessProposal | null {
   if (!raw || typeof raw !== "object") return null;
+  const rawObj = raw as Record<string, unknown>;
 
-  const rawOps = Array.isArray(raw.fileOperations) ? raw.fileOperations : [];
+  const rawOps = Array.isArray(rawObj.fileOperations) ? rawObj.fileOperations : [];
   if (rawOps.length === 0) return null;
 
   const baseWs = workspaceDir ?? process.cwd();
   const fileOperations: ProposedFileOperation[] = [];
-  for (const op of rawOps) {
+  for (const item of rawOps) {
+    if (!item || typeof item !== "object") continue;
+    const op = item as Record<string, unknown>;
     if (
-      op &&
       typeof op.targetPath === "string" &&
       op.targetPath.trim() &&
       typeof op.fullNewContent === "string" &&
@@ -147,11 +194,24 @@ export function normalizeHarnessProposal(
     ) {
       try {
         const safePath = validateTargetPath(baseWs, op.targetPath.trim());
+        const rawComp = typeof op.componentType === "string" ? op.componentType : "";
+        const componentType: EditableComponentType =
+          rawComp === "agents_md" ||
+          rawComp === "append_system" ||
+          rawComp === "skill" ||
+          rawComp === "script" ||
+          rawComp === "subagent" ||
+          rawComp === "guardrail_extension"
+            ? rawComp
+            : "skill";
         fileOperations.push({
           targetPath: safePath,
           operation: op.operation === "update" ? "update" : "create",
-          componentType: op.componentType || "skill",
-          rationale: op.rationale || "Workspace improvement based on recorded evidence.",
+          componentType,
+          rationale:
+            typeof op.rationale === "string" && op.rationale.trim()
+              ? op.rationale.trim()
+              : "Workspace improvement based on recorded evidence.",
           fullNewContent: op.fullNewContent,
         });
       } catch {
@@ -180,21 +240,21 @@ export function normalizeHarnessProposal(
     }
   }
 
-  const rawExp = raw.experienceEntry;
+  const rawExp = rawObj.experienceEntry;
   let situation = triggerResult.humanReadableReasons.join("; ") || "Workspace friction threshold met.";
   let evidenceQuotes: string[] = fallbackQuotes.slice(0, 6);
   let lessonLearned =
-    (typeof raw.diagnosisSummary === "string" && raw.diagnosisSummary.trim()) ||
+    (typeof rawObj.diagnosisSummary === "string" && rawObj.diagnosisSummary.trim()) ||
     "Codified user corrections and tool workflow improvements into workspace configuration.";
 
   if (rawExp && typeof rawExp === "object") {
-    const objExp = rawExp;
+    const objExp = rawExp as Record<string, unknown>;
     if (typeof objExp.situation === "string" && objExp.situation.trim()) {
       situation = objExp.situation.trim();
     }
     if (Array.isArray(objExp.evidenceQuotes) && objExp.evidenceQuotes.length > 0) {
       evidenceQuotes = objExp.evidenceQuotes
-        .map((q) => (typeof q === "string" ? q.trim() : String(q)))
+        .map((q: unknown) => (typeof q === "string" ? q.trim() : String(q)))
         .filter(Boolean);
     }
     if (typeof objExp.lessonLearned === "string" && objExp.lessonLearned.trim()) {
@@ -205,18 +265,18 @@ export function normalizeHarnessProposal(
   }
 
   const diagnosisSummary =
-    typeof raw.diagnosisSummary === "string" && raw.diagnosisSummary.trim()
-      ? raw.diagnosisSummary.trim()
+    typeof rawObj.diagnosisSummary === "string" && rawObj.diagnosisSummary.trim()
+      ? rawObj.diagnosisSummary.trim()
       : `Triggered by: ${situation}`;
 
   return {
     proposalId:
-      typeof raw.proposalId === "string" && raw.proposalId.trim()
-        ? raw.proposalId.trim()
+      typeof rawObj.proposalId === "string" && rawObj.proposalId.trim()
+        ? rawObj.proposalId.trim()
         : `prop-${Date.now()}`,
     createdAt:
-      typeof raw.createdAt === "string" && raw.createdAt.trim()
-        ? raw.createdAt.trim()
+      typeof rawObj.createdAt === "string" && rawObj.createdAt.trim()
+        ? rawObj.createdAt.trim()
         : new Date().toISOString(),
     modelUsed,
     triggerReasons: triggerResult.reasons,
@@ -304,17 +364,18 @@ export function synthesizeDeterministicProposal(
   const evidenceQuotes: string[] = [];
   const lessons: string[] = [];
 
-  const allSteering = records.flatMap((r) => r.steeringEvents);
-  const allInefficiencies = records.flatMap((r) => r.inefficiencyEvents);
-  const allSubagents = records.flatMap((r) => r.subagentEvents);
+  const allSteering = records.flatMap((r) => r.steeringEvents ?? []);
+  const allInefficiencies = records.flatMap((r) => r.inefficiencyEvents ?? []);
+  const allSubagents = records.flatMap((r) => r.subagentEvents ?? []);
 
   // 1. Handle Tool InefficiencyEvents -> Generate Skill(s)
   for (const ev of allInefficiencies.slice(-2)) {
     evidenceQuotes.push(ev.description);
-    const skillSlug = (ev.fingerprint || "workflow-helper")
-      .toLowerCase()
-      .replace(/[^a-z0-9-]+/g, "-")
-      .replace(/^-+|-+$/g, "");
+    const skillSlug =
+      (ev.fingerprint || "workflow-helper")
+        .toLowerCase()
+        .replace(/[^a-z0-9-]+/g, "-")
+        .replace(/^-+|-+$/g, "") || "workflow-helper";
     const workingCmd =
       ev.eventualResolutionCommand ??
       (ev.sprawlScriptsCreated?.length
@@ -355,9 +416,13 @@ export function synthesizeDeterministicProposal(
   // 2. Handle Subagent Revisions -> Generate/Update `.pi/agents/<role>.md`
   if (allSubagents.length > 0) {
     const subEv = allSubagents[allSubagents.length - 1];
-    const roleName = subEv.agentProfile ?? subEv.subagentName ?? "worker";
+    const rawRoleName = subEv.agentProfile ?? subEv.subagentName ?? "worker";
+    const roleName =
+      rawRoleName.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "") || "worker";
+    const revisedList = Array.isArray(subEv.revisedFiles) ? subEv.revisedFiles : [];
+    const followUpList = Array.isArray(subEv.followUpMessages) ? subEv.followUpMessages : [];
     evidenceQuotes.push(
-      `Subagent '${subEv.subagentName}' (${subEv.outcomeSignal}): ${subEv.revisedFiles.join(", ") || subEv.followUpMessages.join(" | ")}`
+      `Subagent '${subEv.subagentName}' (${subEv.outcomeSignal}): ${revisedList.join(", ") || followUpList.join(" | ")}`
     );
     lessons.push(
       `Refine subagent profile '.pi/agents/${roleName}.md' with explicit deliverable verification.`
@@ -397,10 +462,12 @@ export function synthesizeDeterministicProposal(
   );
   if (
     instructionQuestions.length > 0 &&
-    instructionQuestions.some((q) => /rm\s+-rf|overwrite|raw\s+data|删除|覆盖/i.test(q.userMessageQuote))
+    instructionQuestions.some((q) =>
+      /rm\s+-rf|overwrite|raw\s+data|删除|覆盖/i.test(q.userMessageQuote ?? "")
+    )
   ) {
     const q = instructionQuestions[0];
-    evidenceQuotes.push(`User instruction audit: "${q.userMessageQuote}"`);
+    evidenceQuotes.push(`User instruction audit: "${q.userMessageQuote ?? ""}"`);
     const extHeader = "export default function (pi" + ": ExtensionAPI) {";
     const hookHeader = '  pi.on("tool_call", async (event' + ": any, ctx" + ": any) => {";
     fileOperations.push({
@@ -433,9 +500,10 @@ export function synthesizeDeterministicProposal(
 
   const newRules: string[] = [];
   for (const steer of allSteering.slice(-4)) {
-    evidenceQuotes.push(`User (${steer.eventType}): "${steer.userMessageQuote.slice(0, 140)}"`);
+    const quoteText = steer.userMessageQuote ?? "";
+    evidenceQuotes.push(`User (${steer.eventType}): "${quoteText.slice(0, 140)}"`);
     newRules.push(
-      `- **Recorded Workspace Guideline (${steer.eventType})**: ${steer.rationale ?? steer.userMessageQuote.replace(/\r?\n/g, " ").slice(0, 140)}`
+      `- **Recorded Workspace Guideline (${steer.eventType})**: ${steer.rationale ?? quoteText.replace(/\r?\n/g, " ").slice(0, 140)}`
     );
   }
   if (focusHint) {
@@ -447,11 +515,15 @@ export function synthesizeDeterministicProposal(
     );
   }
 
-  const deduplicatedRules = Array.from(new Set(newRules));
+  const deduplicatedRules = Array.from(new Set(newRules)).filter(
+    (rule) => !existingAgentsContent.includes(rule)
+  );
+  const rulesToAppend =
+    deduplicatedRules.length > 0 ? deduplicatedRules : [newRules[0]];
   const sectionHeader = "\n\n## Harness² Self-Improvement Guidelines\n";
   const updatedAgentsMd = existingAgentsContent.includes("## Harness² Self-Improvement Guidelines")
-    ? `${existingAgentsContent.trimEnd()}\n${deduplicatedRules.join("\n")}\n`
-    : `${existingAgentsContent.trimEnd()}${sectionHeader}${deduplicatedRules.join("\n")}\n`;
+    ? `${existingAgentsContent.trimEnd()}\n${rulesToAppend.join("\n")}\n`
+    : `${existingAgentsContent.trimEnd()}${sectionHeader}${rulesToAppend.join("\n")}\n`;
 
   fileOperations.push({
     targetPath: "AGENTS.md",

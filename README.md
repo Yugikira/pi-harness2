@@ -1,4 +1,4 @@
-# `pi-harness2` (v0.3.2) — Self-Improving Workspace Extension for Pi Coding Agent
+# `pi-harness2` (v0.3.3) — Self-Improving Workspace Extension for Pi Coding Agent
 
 `pi-harness2` is a human-in-the-loop extension for [`@earendil-works/pi-coding-agent`](https://github.com/earendil-works/pi) inspired by Google Research's [Harness²: Recursive Agent Harnessing for an Open World (arXiv:2610.14224)](https://arxiv.org/html/2610.14224v1).
 
@@ -13,7 +13,7 @@ Instead of running expensive multi-rollout task-level recursion or modifying Pi 
 
 ## Two-Stage Architecture: Deterministic Digest $\to$ AI Model Semantic Recorder
 
-Instead of relying on brittle regexes to guess what constitutes conflict or inefficiency, `pi-harness2` v0.3.2 mirrors Google Research's [Harness²](https://github.com/google-research/harness2) and [Pi's Compaction architecture](https://pi.dev/docs/latest/compaction):
+Instead of relying on brittle regexes to guess what constitutes conflict or inefficiency, `pi-harness2` v0.3.3 mirrors Google Research's [Harness²](https://github.com/google-research/harness2) and [Pi's Compaction architecture](https://pi.dev/docs/latest/compaction):
 
 1. **Stage 1 — Full Uncompacted Branch Restoration & Token-Bounded Digest (`src/analyzer.ts`)**:
    - Restores **all raw messages across the session** (even messages that were compacted earlier in the session!) by reading `ctx.sessionManager.getBranch()` or the raw `.jsonl` session file on disk and bridging transparently across `type: "compaction"` markers.

@@ -3,7 +3,6 @@ import * as path from "node:path";
 import type {
   BackupManifest,
   HarnessProposal,
-  WorkspaceHarnessState,
 } from "./types.js";
 import {
   getHarness2Dir,
@@ -15,7 +14,7 @@ import {
 export class UnauthorizedTargetPathError extends Error {
   constructor(targetPath: string) {
     super(
-      `Unauthorized harness target path "${targetPath}". Only AGENTS.md, .pi/**, and .agents/skills/** inside the workspace may be modified.`
+      `Unauthorized harness target path "${targetPath}". Only AGENTS.md, .pi/APPEND_SYSTEM.md, .pi/SYSTEM.md, .pi/skills/**, .agents/skills/**, .pi/agents/**, and .pi/extensions/** inside the workspace may be modified.`
     );
     this.name = "UnauthorizedTargetPathError";
   }
@@ -26,11 +25,10 @@ const ALLOWED_PATH_PATTERNS: RegExp[] = [
   /^AGENTS\.override\.md$/i,
   /^\.pi\/APPEND_SYSTEM\.md$/i,
   /^\.pi\/SYSTEM\.md$/i,
-  /^\.pi\/skills\/[A-Za-z0-9_./-]+$/,
-  /^\.agents\/skills\/[A-Za-z0-9_./-]+$/,
+  /^\.pi\/skills\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_.-]+)+$/,
+  /^\.agents\/skills\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_.-]+)+$/,
   /^\.pi\/agents\/[A-Za-z0-9_.-]+\.md$/,
   /^\.pi\/extensions\/[A-Za-z0-9_.-]+\.ts$/,
-  /^\.pi\/harness2\/[A-Za-z0-9_./-]+$/,
 ];
 
 /**
@@ -39,8 +37,11 @@ const ALLOWED_PATH_PATTERNS: RegExp[] = [
  */
 export function validateTargetPath(workspaceDir: string, targetPath: string): string {
   const normalizedRel = targetPath.replace(/\\/g, "/").replace(/^\.\//, "");
+  const segments = normalizedRel.split("/");
   if (
-    normalizedRel.includes("..") ||
+    !normalizedRel ||
+    normalizedRel.endsWith("/") ||
+    segments.some((seg) => seg === "" || seg === "." || seg === "..") ||
     path.isAbsolute(targetPath) ||
     /^[A-Za-z]:/.test(targetPath)
   ) {
@@ -77,11 +78,16 @@ export function applyHarnessProposal(
   workspaceDir: string,
   proposal: HarnessProposal
 ): { backupDir: string; manifest: BackupManifest } {
-  // 1. Validate all paths upfront before touching the filesystem
-  const validatedOps = proposal.fileOperations.map((op) => ({
-    ...op,
-    normalizedPath: validateTargetPath(workspaceDir, op.targetPath),
-  }));
+  // 1. Validate and deduplicate all paths upfront before touching the filesystem
+  const dedupedMap = new Map<
+    string,
+    HarnessProposal["fileOperations"][number] & { normalizedPath: string }
+  >();
+  for (const op of proposal.fileOperations) {
+    const normalizedPath = validateTargetPath(workspaceDir, op.targetPath);
+    dedupedMap.set(normalizedPath, { ...op, normalizedPath });
+  }
+  const validatedOps = Array.from(dedupedMap.values());
 
   const state = loadWorkspaceState(workspaceDir);
   const safeTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -247,20 +253,32 @@ export function undoLatestProposal(workspaceDir: string): {
       }
     }
 
-    // Delete newly created files
-    for (const relPath of manifest.createdFiles) {
+    // Delete newly created files (deepest paths first so nested empty directories clean up cleanly)
+    const resolvedWorkspace = path.resolve(workspaceDir);
+    const sortedCreated = [...manifest.createdFiles].sort(
+      (a, b) => b.split("/").length - a.split("/").length
+    );
+    for (const relPath of sortedCreated) {
       const destPath = path.join(workspaceDir, relPath);
       if (fs.existsSync(destPath)) {
         fs.unlinkSync(destPath);
         deletedFiles.push(relPath);
-        // Clean up empty parent skill directory if applicable
-        const parentDir = path.dirname(destPath);
-        try {
-          if (fs.readdirSync(parentDir).length === 0) {
-            fs.rmdirSync(parentDir);
+        // Clean up empty parent directories up to workspace root
+        let parentDir = path.dirname(destPath);
+        while (
+          parentDir.startsWith(resolvedWorkspace + path.sep) &&
+          parentDir !== resolvedWorkspace
+        ) {
+          try {
+            if (fs.readdirSync(parentDir).length === 0) {
+              fs.rmdirSync(parentDir);
+              parentDir = path.dirname(parentDir);
+            } else {
+              break;
+            }
+          } catch {
+            break;
           }
-        } catch {
-          // Ignore non-empty parent dirs
         }
       }
     }
@@ -272,6 +290,8 @@ export function undoLatestProposal(workspaceDir: string): {
     const state = loadWorkspaceState(workspaceDir);
     state.counters = manifest.previousCounters;
     state.lastProposalAppliedAt = manifest.previousLastProposalAppliedAt;
+    state.snoozeUntilSessionCount = 0;
+    state.snoozedAtInstructionQuestions = 0;
     saveWorkspaceState(workspaceDir, state);
 
     return {

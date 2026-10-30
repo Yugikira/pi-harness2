@@ -88,9 +88,11 @@ export function loadHarness2Config(
   const model = typeof rawModel === "string" && rawModel.trim().length > 0 ? rawModel.trim() : null;
 
   const minSteps =
-    typeof projectPartial.minStepsForInefficientChain === "number"
+    typeof projectPartial.minStepsForInefficientChain === "number" &&
+    Number.isFinite(projectPartial.minStepsForInefficientChain)
       ? projectPartial.minStepsForInefficientChain
-      : typeof globalPartial.minStepsForInefficientChain === "number"
+      : typeof globalPartial.minStepsForInefficientChain === "number" &&
+          Number.isFinite(globalPartial.minStepsForInefficientChain)
         ? globalPartial.minStepsForInefficientChain
         : DEFAULT_HARNESS2_CONFIG.minStepsForInefficientChain;
 

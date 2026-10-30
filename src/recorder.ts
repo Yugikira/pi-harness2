@@ -30,7 +30,7 @@ export function buildRecorderPrompt(
     "",
     "### Recording Rules Rubric",
     "1. **User Steering & Corrections (`steeringEvents` with `eventType: 'corrective_steer' | 'tool_rejection' | 'interruption'`)**:",
-    "   - Record any turn where the user corrects the agent's output, pushes back on tone/style/scope, points out a factual flaw, rejects a tool confirmation, or asks the agent to clean up temporary clutter it left behind.",
+    "   - Record any turn where the user corrects the agent's output, pushes back on tone/style/scope, points out a factual flaw, rejects a tool confirmation, asks the agent to clean up temporary clutter it left behind, or passes an explicit user note to `/harness2 record`.",
     "2. **Explicit Instruction-Compliance / Omission / Logical-Drift Questions (`steeringEvents` with `eventType: 'instruction_compliance_question'`)**:",
     "   - Record any turn where the user explicitly asks WHY the agent ignored instructions, omitted a key premise/hypothesis, or drifted logically from the user's intended thesis (e.g., asking if major logical drift occurred or why an important assumption was left out).",
     "3. **Tool Inefficiencies (`inefficiencyEvents`)**:",
@@ -237,6 +237,13 @@ export async function recordSessionWithModel(
     config,
   });
 
+  if (digest.totalEntriesAnalyzed === 0 && !options.userNote) {
+    return {
+      record: buildRecordFromMechanicalFacts(digest, config, options.userNote),
+      digest,
+    };
+  }
+
   const prompt = buildRecorderPrompt(
     digest,
     options.existingFingerprints ?? [],
@@ -250,31 +257,145 @@ export async function recordSessionWithModel(
       const parsed = parseJsonFromLlmOutput(llmResult.text);
 
       if (parsed) {
-        const steeringEvents = Array.isArray(parsed.steeringEvents)
-          ? (parsed.steeringEvents as UserSteeringEvent[])
+        const rawSteering = Array.isArray(parsed.steeringEvents)
+          ? parsed.steeringEvents
           : [];
+        const steeringEvents: UserSteeringEvent[] = rawSteering
+          .filter((ev): ev is Record<string, unknown> => Boolean(ev && typeof ev === "object"))
+          .map((ev) => {
+            const rawType = typeof ev.eventType === "string" ? ev.eventType : "";
+            const eventType: UserSteeringEvent["eventType"] =
+              rawType === "interruption" ||
+              rawType === "tool_rejection" ||
+              rawType === "corrective_steer" ||
+              rawType === "instruction_compliance_question"
+                ? rawType
+                : "corrective_steer";
+            const quote =
+              typeof ev.userMessageQuote === "string"
+                ? ev.userMessageQuote
+                : typeof ev.quote === "string"
+                  ? ev.quote
+                  : typeof ev.message === "string"
+                    ? ev.message
+                    : "";
+            return {
+              entryIndex: typeof ev.entryIndex === "number" ? ev.entryIndex : 0,
+              eventType,
+              userMessageQuote: quote,
+              precedingAssistantActionSummary:
+                typeof ev.precedingAssistantActionSummary === "string"
+                  ? ev.precedingAssistantActionSummary
+                  : "Assistant action",
+              rationale: typeof ev.rationale === "string" ? ev.rationale : undefined,
+            };
+          });
+
+        if (options.userNote && options.userNote.trim() && steeringEvents.length === 0) {
+          steeringEvents.push({
+            entryIndex: digest.endIndex,
+            eventType: "corrective_steer",
+            userMessageQuote: options.userNote.trim(),
+            precedingAssistantActionSummary: "Manual note passed to /harness2 record",
+          });
+        }
+
         const rawInefficiencies = Array.isArray(parsed.inefficiencyEvents)
-          ? (parsed.inefficiencyEvents as ToolInefficiencyEvent[])
+          ? parsed.inefficiencyEvents
           : [];
-        const inefficiencyEvents: ToolInefficiencyEvent[] = rawInefficiencies.map((ev) => ({
-          ...ev,
-          turnRange: Array.isArray(ev.turnRange) ? ev.turnRange : [0, 0],
-          scoreWeight:
-            typeof ev.scoreWeight === "number"
-              ? ev.scoreWeight
-              : ev.classification === "multi_step_chain" ||
-                  ev.classification === "temp_script_sprawl"
+        const inefficiencyEvents: ToolInefficiencyEvent[] = rawInefficiencies
+          .filter((ev): ev is Record<string, unknown> => Boolean(ev && typeof ev === "object"))
+          .map((ev) => {
+            const rawClass = typeof ev.classification === "string" ? ev.classification : "";
+            const classification: ToolInefficiencyEvent["classification"] =
+              rawClass === "single_retry_recovery" ||
+              rawClass === "multi_step_chain" ||
+              rawClass === "temp_script_sprawl" ||
+              rawClass === "unresolved_error"
+                ? rawClass
+                : "single_retry_recovery";
+            const defaultWeight =
+              classification === "multi_step_chain" || classification === "temp_script_sprawl"
                 ? 3
-                : 1,
-          fingerprint: (ev.fingerprint || "general_tool_inefficiency")
-            .toLowerCase()
-            .replace(/[^a-z0-9_]+/g, "_"),
-          toolsInvoked: Array.isArray(ev.toolsInvoked) ? ev.toolsInvoked : [],
-          description: ev.description || "LLM-identified tool inefficiency",
-        }));
-        const subagentEvents = Array.isArray(parsed.subagentEvents)
-          ? (parsed.subagentEvents as SubagentInferenceEvent[])
+                : 1;
+            const scoreWeight =
+              typeof ev.scoreWeight === "number" &&
+              Number.isFinite(ev.scoreWeight) &&
+              ev.scoreWeight > 0
+                ? ev.scoreWeight
+                : defaultWeight;
+            const rawFp = typeof ev.fingerprint === "string" ? ev.fingerprint : "";
+            const fingerprint =
+              rawFp
+                .toLowerCase()
+                .replace(/[^a-z0-9_]+/g, "_")
+                .replace(/^_+|_+$/g, "") || "general_tool_inefficiency";
+            const turnRange: [number, number] =
+              Array.isArray(ev.turnRange) &&
+              typeof ev.turnRange[0] === "number" &&
+              typeof ev.turnRange[1] === "number"
+                ? [ev.turnRange[0], ev.turnRange[1]]
+                : [0, 0];
+
+            return {
+              turnRange,
+              classification,
+              scoreWeight,
+              fingerprint,
+              toolsInvoked: Array.isArray(ev.toolsInvoked)
+                ? (ev.toolsInvoked as ToolInefficiencyEvent["toolsInvoked"])
+                : [],
+              eventualResolutionCommand:
+                typeof ev.eventualResolutionCommand === "string"
+                  ? ev.eventualResolutionCommand
+                  : undefined,
+              sprawlScriptsCreated: Array.isArray(ev.sprawlScriptsCreated)
+                ? ev.sprawlScriptsCreated.map(String)
+                : undefined,
+              description:
+                typeof ev.description === "string" && ev.description.trim()
+                  ? ev.description.trim()
+                  : "LLM-identified tool inefficiency",
+            };
+          });
+
+        const rawSubagents = Array.isArray(parsed.subagentEvents)
+          ? parsed.subagentEvents
           : [];
+        const subagentEvents: SubagentInferenceEvent[] = rawSubagents
+          .filter((ev): ev is Record<string, unknown> => Boolean(ev && typeof ev === "object"))
+          .map((ev) => {
+            const rawSignal = typeof ev.outcomeSignal === "string" ? ev.outcomeSignal : "";
+            const outcomeSignal: SubagentInferenceEvent["outcomeSignal"] =
+              rawSignal === "orchestrator_revised_files" ||
+              rawSignal === "multiple_corrective_messages" ||
+              rawSignal === "child_error_exit"
+                ? rawSignal
+                : "orchestrator_revised_files";
+            return {
+              subagentName:
+                typeof ev.subagentName === "string" && ev.subagentName.trim()
+                  ? ev.subagentName.trim()
+                  : "worker",
+              agentProfile:
+                typeof ev.agentProfile === "string" && ev.agentProfile.trim()
+                  ? ev.agentProfile.trim()
+                  : undefined,
+              cliRunner:
+                typeof ev.cliRunner === "string" && ev.cliRunner.trim()
+                  ? ev.cliRunner.trim()
+                  : "pi",
+              initialTaskPrompt:
+                typeof ev.initialTaskPrompt === "string" ? ev.initialTaskPrompt : "",
+              outcomeSignal,
+              followUpMessages: Array.isArray(ev.followUpMessages)
+                ? ev.followUpMessages.map(String)
+                : [],
+              revisedFiles: Array.isArray(ev.revisedFiles)
+                ? ev.revisedFiles.map(String)
+                : [],
+            };
+          });
 
         const instructionQuestions = steeringEvents.filter(
           (e) => e.eventType === "instruction_compliance_question"

@@ -1,5 +1,5 @@
 /**
- * Core TypeScript interfaces and Pi Extension API types for `pi-harness2` v0.3.2.
+ * Core TypeScript interfaces and Pi Extension API types for `pi-harness2` v0.3.3.
  * Implements a Two-Stage (Deterministic Uncompacted Digest -> AI Model Semantic Recorder) architecture.
  */
 

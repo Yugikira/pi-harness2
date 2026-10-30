@@ -99,10 +99,10 @@ export function loadRecentTaskRecords(
     .filter((f) => f.endsWith(".json"))
     .sort();
   let records: TaskRecord[] = [];
-  for (const f of files.slice(-Math.max(limit * 2, 20))) {
+  for (const f of files) {
     try {
       const raw = fs.readFileSync(path.join(recordsDir, f), "utf-8");
-      records.push(JSON.parse(raw));
+      records.push(JSON.parse(raw) as TaskRecord);
     } catch {
       // Ignore corrupted record file
     }

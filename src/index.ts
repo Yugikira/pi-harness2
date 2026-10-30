@@ -71,9 +71,40 @@ export async function handleRecordAndCheck(
     ctx.sessionManager?.getSessionId?.() ??
     entries.find((e) => e.type === "session")?.id ??
     "current-session";
-  const startIndex = state.sessionCursors[sessionId] ?? 0;
+  const rawCursor = state.sessionCursors[sessionId] ?? 0;
+  const startIndex = entries.length < rawCursor ? 0 : rawCursor;
 
-  if (isAutoHook && entries.length <= startIndex && !userNote) {
+  if (entries.length <= startIndex && !userNote) {
+    if (!isAutoHook) {
+      ctx.ui.notify(
+        `No new task friction in current session (${sessionId}). Workspace friction counters: ${state.counters.cumulativeUserSteering}/${config.thresholds.userSteeringCount} steering, ${state.counters.cumulativeInefficiencyScore}/${config.thresholds.inefficiencyScore} inefficiency. Run \`/harness2 propose\` to force a proposal or \`/harness2 status\` for details.`,
+        "info"
+      );
+      if (!skipReview) {
+        const triggerEval = evaluateTriggers(state, config, false);
+        if (triggerEval.shouldPropose) {
+          let recentRecords = loadRecentTaskRecords(
+            workspaceDir,
+            10,
+            state.lastProposalAppliedAt
+          );
+          if (recentRecords.length === 0) {
+            recentRecords = loadRecentTaskRecords(workspaceDir, 10);
+          }
+          if (recentRecords.length > 0) {
+            const proposal = await generateHarnessProposal(
+              workspaceDir,
+              recentRecords,
+              triggerEval,
+              state,
+              config,
+              ctx
+            );
+            await runGuidedProposalReview(workspaceDir, proposal, state, ctx);
+          }
+        }
+      }
+    }
     return;
   }
 
@@ -177,17 +208,29 @@ export async function handleHarness2Command(
     );
     if (recentRecords.length === 0) {
       const entries = resolveFullUncompactedEntries(ctx);
-      if (entries.length > 0) {
+      const sessionId =
+        ctx.sessionId ??
+        ctx.sessionManager?.getSessionId?.() ??
+        entries.find((e) => e.type === "session")?.id ??
+        "current-session";
+      const rawCursor = state.sessionCursors[sessionId] ?? 0;
+      const startIndex = entries.length < rawCursor ? 0 : rawCursor;
+
+      if (entries.length > startIndex) {
         const { record: adHocRecord } = await recordSessionWithModel(
           entries,
           {
+            sessionId,
             workspacePath: workspaceDir,
+            startIndex,
             existingFingerprints: Object.keys(state.counters.fingerprintCounts),
             config,
           },
           ctx
         );
         saveTaskRecord(workspaceDir, adHocRecord);
+        applyTaskRecordToState(state, adHocRecord, entries.length);
+        saveWorkspaceState(workspaceDir, state);
         recentRecords = [adHocRecord];
       }
     }
@@ -306,11 +349,21 @@ export default function registerHarness2Extension(pi: PiExtensionAPI): void {
     );
 
     if (choice === "1. Review improvement proposal now" || choice?.startsWith("1.")) {
-      const recentRecords = loadRecentTaskRecords(
+      let recentRecords = loadRecentTaskRecords(
         workspaceDir,
         10,
         state.lastProposalAppliedAt
       );
+      if (recentRecords.length === 0) {
+        recentRecords = loadRecentTaskRecords(workspaceDir, 10);
+      }
+      if (recentRecords.length === 0) {
+        ctx.ui.notify(
+          "No recorded task evidence found for pending proposal.",
+          "warning"
+        );
+        return;
+      }
       const proposal = await generateHarnessProposal(
         workspaceDir,
         recentRecords,

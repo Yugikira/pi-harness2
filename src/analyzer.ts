@@ -268,7 +268,9 @@ export function buildSessionDigest(
     }
 
     if (entry.type === "context_edit") {
-      recentProviderErrorOrContextEdit = true;
+      if (entry.replacement === null) {
+        recentProviderErrorOrContextEdit = true;
+      }
       continue;
     }
 
@@ -329,7 +331,7 @@ export function buildSessionDigest(
             filesRead.add(tcArgs.path);
           } else if (tcName === "write" && typeof tcArgs.path === "string") {
             filesWritten.add(tcArgs.path);
-            const normPath = tcArgs.path.replace(/\\/g, "/");
+            const normPath = tcArgs.path.replace(/\\/g, "/").replace(/^\.\//, "");
             if (!normPath.includes("/") && /\.(py|mjs|cjs|js|sh)$/i.test(normPath)) {
               rootScriptsCreated.add(normPath);
             }
@@ -429,11 +431,27 @@ export function buildSessionDigest(
       }
 
       if (
-        (toolName === "subagent" || /subagent/i.test(resultText)) &&
+        (toolName.startsWith("subagent") ||
+          (toolName === "unknown" && /subagent/i.test(resultText))) &&
         /stopReason:\s*"?error"?|\.exit\b.*error/i.test(resultText)
       ) {
-        for (const tracked of trackedSubagents.values()) {
-          tracked.hadChildErrorExit = true;
+        const specificName =
+          typeof args?.name === "string"
+            ? args.name
+            : typeof args?.agent === "string"
+              ? args.agent
+              : typeof args?.cli === "string"
+                ? args.cli
+                : undefined;
+        const specificSubagent = specificName
+          ? trackedSubagents.get(specificName)
+          : undefined;
+        if (specificSubagent) {
+          specificSubagent.hadChildErrorExit = true;
+        } else {
+          for (const tracked of trackedSubagents.values()) {
+            tracked.hadChildErrorExit = true;
+          }
         }
       }
 

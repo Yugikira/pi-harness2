@@ -126,6 +126,7 @@ export function applyHarnessProposal(
     createdFiles,
     updatedFiles,
     previousCounters: JSON.parse(JSON.stringify(state.counters)),
+    previousLastProposalAppliedAt: state.lastProposalAppliedAt,
   };
 
   fs.writeFileSync(
@@ -267,9 +268,10 @@ export function undoLatestProposal(workspaceDir: string): {
     manifest.reverted = true;
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf-8");
 
-    // Restore previous counters
+    // Restore previous counters and cycle boundary timestamp
     const state = loadWorkspaceState(workspaceDir);
     state.counters = manifest.previousCounters;
+    state.lastProposalAppliedAt = manifest.previousLastProposalAppliedAt;
     saveWorkspaceState(workspaceDir, state);
 
     return {

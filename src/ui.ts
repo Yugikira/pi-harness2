@@ -11,6 +11,7 @@ import {
 import {
   resetStateCounters,
   saveWorkspaceState,
+  snoozeProposalForOneSession,
 } from "./triggers.js";
 
 export const MENU_OPTION_APPLY = "1. Apply Changes (Auto-backup current files)";
@@ -56,13 +57,16 @@ export function formatProposalCard(proposal: HarnessProposal): string {
  * Formats the full file preview for all proposed operations.
  */
 export function formatProposalPreview(proposal: HarnessProposal): string {
-  return proposal.fileOperations
+  const fileOperations = Array.isArray(proposal.fileOperations)
+    ? proposal.fileOperations
+    : [];
+  return fileOperations
     .map((op) =>
       [
-        `=== [${op.operation.toUpperCase()}] ${op.targetPath} (${op.componentType}) ===`,
-        `Rationale: ${op.rationale}`,
+        `=== [${(op.operation || "UPDATE").toUpperCase()}] ${op.targetPath} (${op.componentType || "skill"}) ===`,
+        `Rationale: ${op.rationale || "Workspace improvement"}`,
         "-------------------------------------------------------------------",
-        op.fullNewContent.trimEnd(),
+        (op.fullNewContent || "").trimEnd(),
         "===================================================================",
       ].join("\n")
     )
@@ -125,12 +129,18 @@ export async function runGuidedProposalReview(
     }
 
     if (choice === MENU_OPTION_APPLY || choice.startsWith("1.")) {
-      const { backupDir } = applyHarnessProposal(workspaceDir, proposal);
-      ctx.ui.notify(
-        `Applied ${proposal.fileOperations.length} workspace improvement(s)! Backup saved to ${backupDir}. Run \`/reload\` to activate new skills/agents/extensions, or \`/harness2 undo\` to revert.`,
-        "success"
-      );
-      return "applied";
+      try {
+        const { backupDir } = applyHarnessProposal(workspaceDir, proposal);
+        ctx.ui.notify(
+          `Applied ${proposal.fileOperations.length} workspace improvement(s)! Backup saved to ${backupDir}. Run \`/reload\` to activate new skills/agents/extensions, or \`/harness2 undo\` to revert.`,
+          "success"
+        );
+        return "applied";
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`Failed to apply proposal: ${msg}`, "error");
+        return "cancelled";
+      }
     }
 
     if (choice === MENU_OPTION_DISMISS || choice.startsWith("3.")) {
@@ -146,8 +156,7 @@ export async function runGuidedProposalReview(
     }
 
     if (choice === MENU_OPTION_SNOOZE || choice.startsWith("4.")) {
-      state.snoozeUntilSessionCount =
-        state.counters.sessionsSinceLastProposal + 1;
+      snoozeProposalForOneSession(state);
       saveWorkspaceState(workspaceDir, state);
       ctx.ui.notify("Proposal snoozed for 1 session.", "info");
       return "snoozed";

@@ -1,5 +1,5 @@
 /**
- * Core TypeScript interfaces and Pi Extension API types for `pi-harness2` v0.3.0.
+ * Core TypeScript interfaces and Pi Extension API types for `pi-harness2` v0.3.2.
  * Implements a Two-Stage (Deterministic Uncompacted Digest -> AI Model Semantic Recorder) architecture.
  */
 
@@ -186,6 +186,8 @@ export interface WorkspaceHarnessState {
     fingerprintCounts: Record<string, number>;
   };
   snoozeUntilSessionCount: number;
+  /** Value of cumulativeInstructionQuestions when the user last snoozed a proposal, so already-seen instruction audits respect snooze */
+  snoozedAtInstructionQuestions?: number;
   recentRecordIds: string[];
   dismissedProposalSummaries: string[];
 }
@@ -242,6 +244,7 @@ export interface BackupManifest {
   createdFiles: string[];
   updatedFiles: string[];
   previousCounters: WorkspaceHarnessState["counters"];
+  previousLastProposalAppliedAt?: string;
 }
 
 /**

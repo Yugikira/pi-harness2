@@ -11,6 +11,7 @@ import type {
 } from "./types.js";
 import { resolveImproverModel } from "./config.js";
 import { callPiModel } from "./recorder.js";
+import { validateTargetPath } from "./applier.js";
 
 /**
  * Detects whether the workspace already uses `.agents/skills` (as in session_2.jsonl)
@@ -120,18 +121,21 @@ export function buildReflectionPrompt(
  * Normalizes and validates an LLM-generated or partial proposal object,
  * ensuring all required fields (especially experienceEntry.evidenceQuotes)
  * are present, well-formed, and safely populated with fallbacks from recorded task evidence.
+ * Also filters out any unauthorized target paths so applying the proposal cannot crash.
  */
 export function normalizeHarnessProposal(
   raw: Partial<HarnessProposal> | Record<string, unknown> | null | undefined,
   records: TaskRecord[],
   triggerResult: TriggerEvaluationResult,
-  modelUsed: string
+  modelUsed: string,
+  workspaceDir?: string
 ): HarnessProposal | null {
   if (!raw || typeof raw !== "object") return null;
 
   const rawOps = Array.isArray(raw.fileOperations) ? raw.fileOperations : [];
   if (rawOps.length === 0) return null;
 
+  const baseWs = workspaceDir ?? process.cwd();
   const fileOperations: ProposedFileOperation[] = [];
   for (const op of rawOps) {
     if (
@@ -141,13 +145,18 @@ export function normalizeHarnessProposal(
       typeof op.fullNewContent === "string" &&
       op.fullNewContent.trim()
     ) {
-      fileOperations.push({
-        targetPath: op.targetPath.trim().replace(/\\/g, "/"),
-        operation: op.operation === "update" ? "update" : "create",
-        componentType: op.componentType || "skill",
-        rationale: op.rationale || "Workspace improvement based on recorded evidence.",
-        fullNewContent: op.fullNewContent,
-      });
+      try {
+        const safePath = validateTargetPath(baseWs, op.targetPath.trim());
+        fileOperations.push({
+          targetPath: safePath,
+          operation: op.operation === "update" ? "update" : "create",
+          componentType: op.componentType || "skill",
+          rationale: op.rationale || "Workspace improvement based on recorded evidence.",
+          fullNewContent: op.fullNewContent,
+        });
+      } catch {
+        // Skip unauthorized or malformed target paths
+      }
     }
   }
 
@@ -258,7 +267,8 @@ export async function generateHarnessProposal(
           parsed,
           records,
           triggerResult,
-          llmResult.modelUsed
+          llmResult.modelUsed,
+          workspaceDir
         );
         if (normalized) {
           return normalized;

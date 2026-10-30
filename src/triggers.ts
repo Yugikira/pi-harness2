@@ -35,6 +35,7 @@ export function createInitialWorkspaceState(): WorkspaceHarnessState {
       fingerprintCounts: {},
     },
     snoozeUntilSessionCount: 0,
+    snoozedAtInstructionQuestions: 0,
     recentRecordIds: [],
     dismissedProposalSummaries: [],
   };
@@ -51,6 +52,7 @@ export function loadWorkspaceState(workspaceDir: string): WorkspaceHarnessState 
       ...createInitialWorkspaceState(),
       ...parsed,
       lastProposalAppliedAt: parsed.lastProposalAppliedAt,
+      snoozedAtInstructionQuestions: parsed.snoozedAtInstructionQuestions ?? 0,
       counters: {
         ...createInitialWorkspaceState().counters,
         ...(parsed.counters ?? {}),
@@ -106,14 +108,11 @@ export function loadRecentTaskRecords(
     }
   }
 
-  // Filter to current cycle if sinceTimestamp is provided
+  // Strictly scope to current cycle when sinceTimestamp is provided
   if (sinceTimestamp) {
-    const cycleRecords = records.filter(
+    records = records.filter(
       (r) => r.timestamp && r.timestamp > sinceTimestamp
     );
-    if (cycleRecords.length > 0) {
-      records = cycleRecords;
-    }
   }
 
   // Prioritize records that actually contain friction events
@@ -177,6 +176,20 @@ export function applyTaskRecordToState(
 }
 
 /**
+ * Snoozes pending proposal triggers for 1 session and records the current
+ * `cumulativeInstructionQuestions` watermark so already-acknowledged instruction
+ * audits respect the snooze unless a new instruction violation occurs.
+ */
+export function snoozeProposalForOneSession(
+  state: WorkspaceHarnessState
+): WorkspaceHarnessState {
+  state.snoozeUntilSessionCount = state.counters.sessionsSinceLastProposal + 1;
+  state.snoozedAtInstructionQuestions =
+    state.counters.cumulativeInstructionQuestions;
+  return state;
+}
+
+/**
  * Evaluates whether the workspace's accumulated state crosses any trigger threshold.
  */
 export function evaluateTriggers(
@@ -192,12 +205,17 @@ export function evaluateTriggers(
     humanReadableReasons.push("Manual `/harness2 propose` requested by user.");
   }
 
-  // Respect snooze unless an explicit instruction violation query occurred or forcePropose is true
+  // Respect snooze unless a NEW explicit instruction violation query occurred after snoozing, or forcePropose is true
+  const hasNewUnsnoozedInstructionQuestion =
+    state.counters.cumulativeInstructionQuestions >=
+      config.thresholds.instructionViolationQuery &&
+    state.counters.cumulativeInstructionQuestions >
+      (state.snoozedAtInstructionQuestions ?? 0);
+
   const isSnoozed =
     !forcePropose &&
     state.snoozeUntilSessionCount > state.counters.sessionsSinceLastProposal &&
-    state.counters.cumulativeInstructionQuestions <
-      config.thresholds.instructionViolationQuery;
+    !hasNewUnsnoozedInstructionQuestion;
 
   if (isSnoozed) {
     return { shouldPropose: false, reasons: [], humanReadableReasons: [] };
@@ -280,6 +298,7 @@ export function resetStateCounters(
     fingerprintCounts: {},
   };
   state.snoozeUntilSessionCount = 0;
+  state.snoozedAtInstructionQuestions = 0;
   state.lastProposalAppliedAt = new Date().toISOString();
   return state;
 }

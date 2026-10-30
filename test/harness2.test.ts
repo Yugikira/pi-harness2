@@ -24,8 +24,11 @@ import {
   applyTaskRecordToState,
   createInitialWorkspaceState,
   evaluateTriggers,
+  loadRecentTaskRecords,
   loadWorkspaceState,
+  saveTaskRecord,
   saveWorkspaceState,
+  snoozeProposalForOneSession,
 } from "../src/triggers.js";
 import {
   UnauthorizedTargetPathError,
@@ -43,11 +46,8 @@ import {
   MENU_OPTION_DISMISS,
   MENU_OPTION_PREVIEW,
   formatProposalCard,
+  formatProposalPreview,
 } from "../src/ui.js";
-import {
-  loadRecentTaskRecords,
-  saveTaskRecord,
-} from "../src/triggers.js";
 import registerHarness2Extension from "../src/index.js";
 import type {
   HarnessProposal,
@@ -269,7 +269,7 @@ describe("2. Stage 1 — Uncompacted Session Digest & Mechanical Facts (UT-DIG)"
     assert.ok(!digest.serializedTranscript.includes("Very long internal reasoning"));
   });
 
-  it("UT-DIG-02: ignores context_edit retracted turns and provider stopReason=error duplicate user resends, while preserving intentional repetition", () => {
+  it("UT-DIG-02: ignores context_edit retracted turns, provider stopReason=error, and empty aborted retries while preserving intentional repetition", () => {
     const entries: PiSessionEntry[] = [
       {
         type: "message",
@@ -307,6 +307,38 @@ describe("2. Stage 1 — Uncompacted Session Digest & Mechanical Facts (UT-DIG)"
     assert.equal(digest.mechanicalFacts.networkRetriesIgnored, 1);
     const matches = digest.serializedTranscript.match(/Please fix slide 3 logical drift/g) ?? [];
     assert.equal(matches.length, 1);
+
+    // Also verify empty stopReason="aborted" followed by user duplicate resend is treated as a retry
+    const abortedEntries: PiSessionEntry[] = [
+      {
+        type: "message",
+        id: "u1-abort",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Please summarize the key empirical findings in detail." }],
+        },
+      },
+      {
+        type: "message",
+        id: "a1-abort",
+        message: {
+          role: "assistant",
+          stopReason: "aborted",
+          content: [],
+        },
+      },
+      {
+        type: "message",
+        id: "u2-abort-resend",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Please summarize the key empirical findings in detail." }],
+        },
+      },
+    ];
+
+    const abortedDigest = buildSessionDigest(abortedEntries);
+    assert.equal(abortedDigest.mechanicalFacts.networkRetriesIgnored, 1);
 
     // Verify intentional user repetitions without provider errors are preserved
     const intentionalRepeatEntries: PiSessionEntry[] = [
@@ -531,13 +563,15 @@ describe("4. Atomic File Applier, Path Safety & Undo (UT-APP)", () => {
     assert.equal(validateTargetPath(ws, ".pi/extensions/guard.ts"), ".pi/extensions/guard.ts");
   });
 
-  it("UT-APP-02: creates atomic backup on apply and restores byte-for-byte on /harness2 undo", () => {
+  it("UT-APP-02: creates atomic backup on apply and restores byte-for-byte (including lastProposalAppliedAt) on /harness2 undo", () => {
     const ws = makeTempDir("ws-undo");
     const originalAgents = "# Original AGENTS.md\nKeep it minimal.\n";
     fs.writeFileSync(path.join(ws, "AGENTS.md"), originalAgents, "utf-8");
 
     const state = loadWorkspaceState(ws);
     state.counters.cumulativeUserSteering = 3;
+    const priorCycleTimestamp = "2026-10-28T08:00:00.000Z";
+    state.lastProposalAppliedAt = priorCycleTimestamp;
     saveWorkspaceState(ws, state);
 
     const proposal: HarnessProposal = {
@@ -572,12 +606,15 @@ describe("4. Atomic File Applier, Path Safety & Undo (UT-APP)", () => {
     applyHarnessProposal(ws, proposal);
     assert.ok(fs.readFileSync(path.join(ws, "AGENTS.md"), "utf-8").includes("## New Section"));
     assert.ok(fs.existsSync(path.join(ws, ".pi/skills/csv-helper/SKILL.md")));
+    assert.notEqual(loadWorkspaceState(ws).lastProposalAppliedAt, priorCycleTimestamp);
 
     const undoRes = undoLatestProposal(ws);
     assert.equal(undoRes.reverted, true);
     assert.equal(fs.readFileSync(path.join(ws, "AGENTS.md"), "utf-8"), originalAgents);
     assert.equal(fs.existsSync(path.join(ws, ".pi/skills/csv-helper/SKILL.md")), false);
-    assert.equal(loadWorkspaceState(ws).counters.cumulativeUserSteering, 3);
+    const restoredState = loadWorkspaceState(ws);
+    assert.equal(restoredState.counters.cumulativeUserSteering, 3);
+    assert.equal(restoredState.lastProposalAppliedAt, priorCycleTimestamp);
   });
 });
 
@@ -687,7 +724,7 @@ describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CM
     assert.equal(fs.existsSync(path.join(ws, ".pi/extensions/workspace-guardrail.ts")), false);
   });
 
-  it("IT-AUTO-01: hooks session_before_compact and session_shutdown in auto mode without double-counting", async () => {
+  it("IT-AUTO-01: hooks session_before_compact and session_shutdown in auto mode without double-counting or blocking compaction", async () => {
     const ws = makeTempDir("ws-auto");
     fs.mkdirSync(path.join(ws, ".pi"), { recursive: true });
     fs.writeFileSync(
@@ -726,6 +763,7 @@ describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CM
       },
     ];
 
+    let uiSelectCalledDuringAutoHook = false;
     const ctx: PiCommandContext = {
       cwd: ws,
       sessionId: "sess-auto-compact",
@@ -738,6 +776,7 @@ describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CM
       ui: {
         notify() {},
         async select() {
+          uiSelectCalledDuringAutoHook = true;
           return MENU_OPTION_DISMISS;
         },
         async confirm() {
@@ -746,11 +785,12 @@ describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CM
       },
     };
 
-    // 1. Trigger `session_before_compact` -> records entries 0..2
+    // 1. Trigger `session_before_compact` -> records entries 0..2 without launching interactive UI
     const beforeCompact = hooks.get("session_before_compact")!;
     await beforeCompact({ branchEntries }, ctx);
     assert.equal(promptsReceived.length, 1);
     assert.equal(loadWorkspaceState(ws).counters.cumulativeUserSteering, 1);
+    assert.equal(uiSelectCalledDuringAutoHook, false);
 
     // 2. Trigger `session_shutdown` with no new entries -> cursor is already at 2, so 0 new LLM calls!
     const onShutdown = hooks.get("session_shutdown")!;
@@ -769,6 +809,7 @@ describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CM
     await onShutdown({}, ctx);
     assert.equal(promptsReceived.length, 2);
     assert.equal(loadWorkspaceState(ws).counters.cumulativeUserSteering, 2);
+    assert.equal(uiSelectCalledDuringAutoHook, false);
   });
 
   it("IT-REAL-01 & IT-REAL-02: compresses 3.7MB real session_1/session_2 logs into compact digests and feeds LLM Judge", async () => {
@@ -902,7 +943,7 @@ describe("5. End-to-End Integration, Compaction Hooks & Real Session Logs (IT-CM
 });
 
 describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup Hook", () => {
-  it("UT-NORM-01: normalizes LLM proposal missing experienceEntry or evidenceQuotes without throwing", () => {
+  it("UT-NORM-01: normalizes LLM proposal missing experienceEntry or evidenceQuotes and filters unauthorized paths without throwing", () => {
     const rawProposalWithoutExp = {
       diagnosisSummary: "Standardize literature queries into reusable skill",
       fileOperations: [
@@ -912,6 +953,13 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
           componentType: "skill",
           rationale: "Replaces temporary scripts with reusable skill",
           fullNewContent: "# Literature Search Skill",
+        },
+        {
+          targetPath: "src/unauthorized.ts",
+          operation: "update",
+          componentType: "script",
+          rationale: "Should be stripped by path validation",
+          fullNewContent: "// unauthorized",
         },
       ],
     };
@@ -979,14 +1027,22 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
         (q) => q.includes("temp_script_sprawl") || q.includes("root directory")
       )
     );
+    // Unauthorized path src/unauthorized.ts should be filtered out, leaving only the valid skill path
     assert.equal(normalized.fileOperations.length, 1);
+    assert.equal(
+      normalized.fileOperations[0].targetPath,
+      ".pi/skills/literature-search/SKILL.md"
+    );
 
-    // Verify formatProposalCard renders safely without throwing undefined is not an object
+    // Verify formatProposalCard and formatProposalPreview render safely without throwing
     const cardText = formatProposalCard(normalized);
     assert.ok(cardText.includes("Proposal ID:"));
     assert.ok(cardText.includes("Observed Evidence:"));
 
-    // Verify raw malformed proposal also does not crash formatProposalCard
+    const previewText = formatProposalPreview(normalized);
+    assert.ok(previewText.includes("literature-search/SKILL.md"));
+
+    // Verify raw malformed proposal also does not crash formatProposalCard or formatProposalPreview
     const rawPartialProposal = {
       proposalId: "prop-raw-test",
       createdAt: new Date().toISOString(),
@@ -997,6 +1053,8 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
     };
     const safeCard = formatProposalCard(rawPartialProposal);
     assert.ok(safeCard.includes("prop-raw-test"));
+    const safePreview = formatProposalPreview(rawPartialProposal);
+    assert.equal(safePreview, "");
 
     const ws = makeTempDir("ws-exp-test");
     // Verify appendExperienceEntry also executes without throwing
@@ -1083,7 +1141,7 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
     assert.ok(loaded.some((r) => r.steeringEvents.length > 0));
   });
 
-  it("IT-AUTO-02: next-session startup prompts user when prior threshold met and handles review/snooze", async () => {
+  it("IT-AUTO-02: next-session startup prompts user when prior threshold met, respects snooze even for instruction audits, and re-prompts when new violation or next session occurs", async () => {
     const ws = makeTempDir("ws-session-start");
     fs.mkdirSync(path.join(ws, ".pi"), { recursive: true });
     fs.writeFileSync(
@@ -1092,8 +1150,9 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
       "utf-8"
     );
 
-    // Seed state with friction crossing instruction violation threshold
+    // Seed state with friction crossing instruction violation threshold (from 1 completed session)
     const state = createInitialWorkspaceState();
+    state.counters.sessionsSinceLastProposal = 1;
     state.counters.cumulativeInstructionQuestions = 1;
     saveWorkspaceState(ws, state);
 
@@ -1137,6 +1196,7 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
     registerHarness2Extension(mockPi);
 
     // Scenario 1: User starts session and selects "Not now (snooze for 1 session)"
+    let selectPromptCount = 0;
     let selectPromptText = "";
     const ctxSnooze = {
       cwd: ws,
@@ -1144,6 +1204,7 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
       ui: {
         notify() {},
         async select(prompt, options) {
+          selectPromptCount += 1;
           selectPromptText = prompt;
           return "2. Not now (snooze for 1 session)";
         },
@@ -1157,13 +1218,32 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
     assert.ok(sessionStartHook);
 
     await sessionStartHook({}, ctxSnooze);
+    assert.equal(selectPromptCount, 1);
     assert.ok(selectPromptText.includes("Harness² detected recurring workspace friction"));
     const snoozedState = loadWorkspaceState(ws);
-    assert.equal(snoozedState.snoozeUntilSessionCount, 1);
+    assert.equal(snoozedState.snoozeUntilSessionCount, 2);
+    assert.equal(snoozedState.snoozedAtInstructionQuestions, 1);
 
-    // Scenario 2: User starts session and selects "1. Review improvement proposal now"
-    // Reset snooze count for test
-    snoozedState.snoozeUntilSessionCount = 0;
+    // Verify evaluateTriggers now returns shouldPropose=false while snoozed!
+    assert.equal(
+      evaluateTriggers(snoozedState, DEFAULT_HARNESS2_CONFIG, false).shouldPropose,
+      false
+    );
+
+    // Verify re-running sessionStartHook while still in snoozed window does not prompt
+    await sessionStartHook({}, ctxSnooze);
+    assert.equal(selectPromptCount, 1);
+
+    // Verify that if a NEW instruction compliance question occurs (cumulativeInstructionQuestions = 2), it breaks through snooze
+    snoozedState.counters.cumulativeInstructionQuestions = 2;
+    assert.equal(
+      evaluateTriggers(snoozedState, DEFAULT_HARNESS2_CONFIG, false).shouldPropose,
+      true
+    );
+
+    // Scenario 2: After 1 session completes (sessionsSinceLastProposal = 2), snooze expires and user reviews proposal
+    snoozedState.counters.cumulativeInstructionQuestions = 1;
+    snoozedState.counters.sessionsSinceLastProposal = 2;
     saveWorkspaceState(ws, snoozedState);
 
     let proposalReviewed = false;
@@ -1192,7 +1272,7 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
     assert.equal(proposalReviewed, true);
   });
 
-  it("UT-NORM-03: loadRecentTaskRecords scopes to current cycle when sinceTimestamp / lastProposalAppliedAt is set", () => {
+  it("UT-NORM-03: loadRecentTaskRecords strictly scopes to current cycle and returns [] when no records exist after lastProposalAppliedAt", () => {
     const ws = makeTempDir("ws-cycle-boundary");
 
     // Old cycle: record created at 10:00
@@ -1227,6 +1307,11 @@ describe("6. Proposal Normalization, Safe Card Rendering & Next-Session Startup 
 
     // Proposal was applied at 10:10
     const proposalAppliedAt = "2026-10-29T10:10:00.000Z";
+
+    // Right after proposal is applied at 10:10 (before any new records are saved),
+    // loadRecentTaskRecords must return [] rather than leaking old cycle records!
+    const emptyNewCycleRecords = loadRecentTaskRecords(ws, 10, proposalAppliedAt);
+    assert.equal(emptyNewCycleRecords.length, 0);
 
     // New cycle: record created at 10:20
     saveTaskRecord(ws, {

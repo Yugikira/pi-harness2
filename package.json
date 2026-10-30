@@ -1,6 +1,6 @@
 {
   "name": "pi-harness2",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Self-improving local workspace extension for Pi Coding Agent inspired by Google Research's Harness2",
   "type": "module",
   "main": "./index.ts",

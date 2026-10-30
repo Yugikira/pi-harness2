@@ -1,7 +1,7 @@
 # Technical & Test Specification: `pi-harness2` Workspace Self-Improvement Extension
 
-- **Document Version:** 0.3.0  
-- **Date:** October 28, 2026  
+- **Document Version:** 0.3.2  
+- **Date:** October 29, 2026  
 - **Companion Document:** `pi-harness2-prd.md`  
 - **Host Runtime:** [@earendil-works/pi-coding-agent](https://github.com/earendil-works/pi) (`Node.js >= 22.19`, TypeScript Extension API)  
 - **Target Subagent System:** Forked [interactive-subagents](https://drive.google.com/drive/folders/1HWVPXDBd5c3LWr3-lY_HbHZptSXzIem-) ([README.md](https://drive.google.com/file/d/1sasZ6hOROTiGDIkQeprSkj1mds_ba26T/view?usp=drivesdk), [CHANGELOG.md](https://drive.google.com/file/d/1lAnHliH7iUpMbioREtz8oAoOVBqhQTU_/view?usp=drivesdk))  
@@ -19,6 +19,7 @@
 pi-harness2/
 ├── package.json                  # Manifest & optional peerDependencies
 ├── tsconfig.json
+├── CHANGELOG.md                  # Release history
 ├── index.ts                      # Re-export entrypoint for Pi package loaders
 ├── scripts/
 │   └── run-tests.mjs             # Zero-dependency test runner using node:test
@@ -27,15 +28,15 @@ pi-harness2/
 │   ├── config.ts                 # Merges ~/.pi/agent/settings.json and <cwd>/.pi/settings.json
 │   ├── analyzer.ts               # Stage 1: Uncompacted branch restoration & deterministic SessionDigest builder
 │   ├── recorder.ts               # Stage 2: AI Model Semantic Recorder (callPiModel & mechanical fallback)
-│   ├── triggers.ts               # Evaluates trigger thresholds against accumulated WorkspaceHarnessState
-│   ├── improver.ts               # LLM reflection & proposal synthesis (Harness² Compose + Reflect)
+│   ├── triggers.ts               # Evaluates trigger thresholds & cycle boundaries against WorkspaceHarnessState
+│   ├── improver.ts               # LLM reflection, schema normalization & proposal synthesis
 │   ├── applier.ts                # Atomic file writer, backup manager, and /harness2 undo engine
 │   ├── ui.ts                     # Guided TUI proposal cards, diff previewer, and ctx.ui menus
 │   └── types.ts                  # TypeScript interfaces matching Pi Extension API & schemas
 ├── test/
 │   ├── fixtures/
 │   │   └── real-sessions-sample.jsonl # Sample real session transcript fixture
-│   └── harness2.test.ts          # Comprehensive unit & integration test suite (13 test cases)
+│   └── harness2.test.ts          # Comprehensive unit & integration test suite (17 test cases)
 └── docs/
     ├── pi-harness2-prd.md        # Product Requirements Document
     └── pi-harness2-spec.md       # Technical & Test Specification (this document)
@@ -60,13 +61,13 @@ Inside any user workspace (`<cwd>`), `pi-harness2` reads and writes to `.pi/harn
     ├── extensions/                           # Workspace-specific guardrail extensions (Created/Edited by pi-harness2)
     │   └── <guardrail-name>.ts
     └── harness2/                             # Internal state managed by pi-harness2
-        ├── state.json                        # Cumulative counters, active thresholds, per-session cursors
+        ├── state.json                        # Cumulative counters, cycle boundary, snooze watermarks, per-session cursors
         ├── EXPERIENCE.md                     # Harness² persistent lesson log (human & LLM readable)
         ├── records/
         │   └── <YYYYMMDD-HHMMSS>_<recordId>.json # Structured TaskRecord snapshots
         └── backups/
             └── <ISO-timestamp>_<proposalId>/
-                ├── manifest.json             # List of created vs. modified files and prior counters
+                ├── manifest.json             # List of created vs. modified files, prior counters, and prior cycle boundary
                 └── files/                    # Exact copies of modified files prior to apply
 ```
 
@@ -77,7 +78,7 @@ Following the peer-dependency best practice established in [interactive-subagent
 ```json
 {
   "name": "pi-harness2",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "type": "module",
   "main": "./index.ts",
   "peerDependencies": {
@@ -120,7 +121,8 @@ export interface Harness2Thresholds {
 export interface Harness2Config {
   /**
    * "manual" (default): only records when user runs `/harness2` or `/harness2 record`.
-   * "auto": automatically records before compaction (`session_before_compact`) and at session end (`session_shutdown`).
+   * "auto": automatically records before compaction (`session_before_compact`), at session end (`session_shutdown`),
+   * and prompts for pending proposal review at the start of the next session (`session_start`).
    */
   recordMode: "manual" | "auto";
   /**
@@ -269,12 +271,14 @@ export interface TaskRecord {
 
 ### 2.4 Workspace State Schema (`.pi/harness2/state.json`)
 
-Tracks cumulative counters and per-session cursors to avoid duplicate counting:
+Tracks cumulative counters, active cycle boundary, snooze watermarks, and per-session cursors to avoid duplicate counting:
 
 ```typescript
 export interface WorkspaceHarnessState {
   schemaVersion: 1;
   lastUpdated: string;
+  /** ISO timestamp of the last applied, dismissed, or reset proposal, defining the boundary of the current friction cycle */
+  lastProposalAppliedAt?: string;
   /** Map of sessionId -> last analyzed raw entry index for idempotent incremental recording */
   sessionCursors: Record<string, number>;
   counters: {
@@ -287,6 +291,8 @@ export interface WorkspaceHarnessState {
     fingerprintCounts: Record<string, number>;
   };
   snoozeUntilSessionCount: number;
+  /** Value of cumulativeInstructionQuestions when the user last snoozed a proposal */
+  snoozedAtInstructionQuestions?: number;
   recentRecordIds: string[];
   dismissedProposalSummaries: string[];
 }
@@ -304,7 +310,7 @@ export interface WorkspaceHarnessState {
  │ Stage 1: Deterministic Digest (src/analyzer.ts)             │
  │  • Full branch restoration across compaction boundaries    │
  │  • Strip <thinking>, images, and skill injections          │
- │  • Deduplicate provider errors & retracted turns           │
+ │  • Deduplicate provider errors, empty aborts & retractions │
  │  • Extract MechanicalSessionFacts via AST                  │
  └───────────────────────────┬─────────────────────────────────┘
                              │ SessionDigest (~15-25 KB)
@@ -322,7 +328,8 @@ export interface WorkspaceHarnessState {
  │ Stage 3: Workspace State, Triggers & Proposals              │
  │  • Update .pi/harness2/state.json                           │
  │  • Evaluate thresholds (Rule 1-5 in src/triggers.ts)        │
- │  • Launch Guided TUI Proposal Flow (src/improver.ts, ui.ts) │
+ │  • Normalize & validate proposal (src/improver.ts)          │
+ │  • Launch Guided TUI Proposal Flow (src/ui.ts, applier.ts)  │
  └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -336,7 +343,7 @@ Per requirement, `src/analyzer.ts` inspects **only the main orchestrator session
    - Omits `<thinking>` internal blocks.
    - Replaces multi-megabyte base64 `image` parts with `[Binary image content omitted from text digest]`.
    - Filters out retracted assistant turns (`context_edit` with `replacement: null`).
-   - Discards duplicate user retry prompts when immediately preceded by a provider `stopReason: "error"` or context edit. Intentional repeated user messages without provider errors are preserved.
+   - Discards duplicate user retry prompts when immediately preceded by a provider `stopReason: "error"`, `context_edit`, or an empty `stopReason: "aborted"` turn. Intentional repeated user messages after normal assistant responses are preserved.
    - Strips `<skill>` system prompt injection tags.
    - Result: A 3.7 MB raw `.jsonl` session log is reduced to a concise ~15–25 KB digest.
 3. **Mechanical AST Facts Extraction**:
@@ -382,9 +389,9 @@ Instead of hardcoded regular expressions, an AI Model judges the interaction sem
 
 ### 4.2 Reflection & Proposal Synthesis (`src/improver.ts`)
 
-Once triggered, `generateHarnessProposal` calls `callPiModel` with the accumulated `TaskRecord` evidence, existing `AGENTS.md`, and `EXPERIENCE.md`.
+Once triggered, `generateHarnessProposal` calls `callPiModel` with up to 10 recent `TaskRecord`s scoped to the active improvement cycle (`sinceTimestamp: state.lastProposalAppliedAt`), prioritizing records containing friction events over empty runs, along with existing `AGENTS.md` and `EXPERIENCE.md`.
 
-Target modification paths are strictly confined to authorized harness files:
+`normalizeHarnessProposal` validates the returned JSON object, populates fallback `evidenceQuotes` from the recorded task evidence if omitted by the LLM, and validates all target modification paths via `validateTargetPath`:
 - `AGENTS.md` or `AGENTS.override.md`
 - `.pi/APPEND_SYSTEM.md` or `.pi/SYSTEM.md`
 - `.pi/skills/<skill-name>/SKILL.md` (or `.agents/skills/<skill-name>/SKILL.md`)
@@ -398,17 +405,17 @@ If offline, `synthesizeDeterministicProposal` provides safe baseline proposals f
 1. **Path Safety (`validateTargetPath`)**:
    Blocks path traversal (`..`), absolute paths, and any file outside allowed workspace configuration locations. Modifying application source files (e.g. `src/index.ts`) throws `UnauthorizedTargetPathError`.
 2. **Atomic Backup**:
-   Before modifying or creating files, copies existing versions into `.pi/harness2/backups/<timestamp>_<proposalId>/files/` and writes `manifest.json`.
+   Before modifying or creating files, copies existing versions into `.pi/harness2/backups/<timestamp>_<proposalId>/files/` and writes `manifest.json` (storing `previousCounters` and `previousLastProposalAppliedAt`).
 3. **One-Step Undo (`undoLatestProposal`)**:
-   Restores modified files byte-for-byte from the latest backup manifest, deletes files created by the proposal, restores previous counters, and marks the backup reverted.
+   Restores modified files byte-for-byte from the latest backup manifest, deletes files created by the proposal, restores previous counters and `lastProposalAppliedAt`, and marks the backup reverted.
 
 ### 4.4 Guided TUI Review (`src/ui.ts`)
 
 Presents an interactive proposal card to the user:
-- `1. Apply Changes (Auto-backup current files)`: Executes atomic apply, logs to `EXPERIENCE.md`, resets counters, and notifies user.
+- `1. Apply Changes (Auto-backup current files)`: Executes atomic apply, logs to `EXPERIENCE.md`, resets counters, sets `lastProposalAppliedAt`, and notifies user.
 - `2. Preview Exact File Changes / Diffs`: Displays full content and rationale of each proposed change.
-- `3. Dismiss Proposal (Log reason & reset counter)`: Appends dismissal to `EXPERIENCE.md` and resets counters.
-- `4. Snooze for 1 Session`: Postpones proposal for 1 session.
+- `3. Dismiss Proposal (Log reason & reset counter)`: Appends dismissal to `EXPERIENCE.md`, resets counters, and sets `lastProposalAppliedAt`.
+- `4. Snooze for 1 Session`: Postpones proposal for 1 session via `snoozeProposalForOneSession(state)`.
 
 ---
 
@@ -417,9 +424,11 @@ Presents an interactive proposal card to the user:
 ### 5.1 Lifecycle Hooks
 
 - **Pre-Compaction Hook (`session_before_compact`)**:
-  When `recordMode: "auto"`, reads `event.branchEntries` before Pi compacts the context, recording new turns since `state.sessionCursors[sessionId]` without interfering with Pi's compaction.
+  When `recordMode: "auto"`, reads `event.branchEntries` before Pi compacts the context, recording new turns since `state.sessionCursors[sessionId]` with `skipReview: true` so compaction is never blocked by an interactive menu.
 - **Session Shutdown Hook (`session_shutdown`)**:
-  When `recordMode: "auto"`, reads remaining turns from the session branch/file and records them at session close.
+  When `recordMode: "auto"`, reads remaining turns from the session branch/file and records them at session close with `skipReview: true`.
+- **Next-Session Proposal Prompt Hook (`session_start`)**:
+  When starting a new session in `recordMode: "auto"`, evaluates triggers against accumulated state and prompts the user with interactive choices (`1. Review improvement proposal now` or `2. Not now (snooze for 1 session)`).
 - **Per-Session Cursor (`state.sessionCursors`)**:
   Ensures that entries recorded during `session_before_compact` are never double-counted when `session_shutdown` or `/harness2 record` runs later.
 
@@ -427,9 +436,9 @@ Presents an interactive proposal card to the user:
 
 - `/harness2` or `/harness2 record [note]`: Record orchestrator transcript, evaluate triggers, and launch proposal review.
 - `/harness2 status`: Show active counters, recurring fingerprints, and configuration.
-- `/harness2 propose [focus]`: Force immediate proposal synthesis even if counters are below threshold.
+- `/harness2 propose [focus]`: Force immediate proposal synthesis from current-cycle records (or ad-hoc recording of the active session) even if counters are below threshold.
 - `/harness2 undo`: Roll back the most recently applied proposal in one step.
-- `/harness2 reset`: Reset workspace friction counters to 0 while keeping `EXPERIENCE.md`.
+- `/harness2 reset`: Reset workspace friction counters to 0 and advance `lastProposalAppliedAt` while keeping `EXPERIENCE.md`.
 - `harnees2`: Registered alias for command convenience.
 
 ---
@@ -444,12 +453,16 @@ The test suite is executed with `npm test` (`node scripts/run-tests.mjs`), requi
 | **UT-CFG-02** | Config | Inherits global settings from `~/.pi/agent/settings.json` |
 | **UT-CFG-03** | Config | Project `.pi/settings.json` overrides global settings; model resolves cleanly |
 | **UT-DIG-01** | Stage 1 Digest | Restores pre-compaction messages across `compaction` entries; strips thinking and images |
-| **UT-DIG-02** | Stage 1 Digest | Ignores `context_edit` retracted turns and provider error retries; preserves intentional repeats |
+| **UT-DIG-02** | Stage 1 Digest | Ignores `context_edit` retracted turns, provider error retries, and empty aborted retries; preserves intentional repeats |
 | **UT-DIG-03** | Stage 1 Digest | Extracts mechanical facts: root script sprawl, failed tool calls, subagent file revisions |
 | **UT-REC-01** | Stage 2 Recorder | Calls `ctx.modelRegistry.complete` with `SessionDigest` and parses LLM semantic judgment |
 | **UT-TRG-01 & 03** | Stage 2 Triggers | Accumulates single-occurrence frictions (+1) and triggers on recurring fingerprint across tasks |
 | **UT-APP-01** | Applier Safety | Blocks path traversal (`..`) and unauthorized target source paths |
-| **UT-APP-02** | Applier Undo | Creates atomic backup on apply and restores workspace byte-for-byte on `/harness2 undo` |
+| **UT-APP-02** | Applier Undo | Creates atomic backup on apply and restores workspace byte-for-byte (including `lastProposalAppliedAt`) on `/harness2 undo` |
 | **IT-CMD-01 & 02** | E2E Command | Executes `/harness2 record` with LLM Judge $\to$ Preview $\to$ Apply $\to$ Undo |
-| **IT-AUTO-01** | Auto Hooks | Hooks `session_before_compact` and `session_shutdown` in auto mode without double-counting |
+| **IT-AUTO-01** | Auto Hooks | Hooks `session_before_compact` and `session_shutdown` in auto mode without double-counting or blocking compaction |
 | **IT-REAL-01 & 02** | Real Logs | Compresses real 3.7 MB session logs into compact digests and feeds LLM Judge |
+| **UT-NORM-01** | Normalization | Normalizes partial LLM proposals, backfills `evidenceQuotes`, filters unauthorized paths, and renders cards/previews safely |
+| **UT-NORM-02** | Prioritization | Prioritizes task records containing friction events over empty session records |
+| **IT-AUTO-02** | Startup & Snooze | Prompts user on `session_start`, respects snooze even for instruction audits, and re-prompts on new violation or next session |
+| **UT-NORM-03** | Cycle Scoping | Strictly scopes `loadRecentTaskRecords` to `lastProposalAppliedAt` without leaking old-cycle records |

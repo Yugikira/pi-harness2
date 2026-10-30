@@ -25,6 +25,7 @@ import {
   resetStateCounters,
   saveTaskRecord,
   saveWorkspaceState,
+  snoozeProposalForOneSession,
 } from "./triggers.js";
 import { generateHarnessProposal } from "./improver.js";
 import { undoLatestProposal } from "./applier.js";
@@ -192,7 +193,7 @@ export async function handleHarness2Command(
     }
     if (recentRecords.length === 0) {
       ctx.ui.notify(
-        "No task records found in `.pi/harness2/records/` to propose improvements from. Use Pi to work on tasks first, then run `/harness2` or `/harness2 propose`.",
+        "No task records found in `.pi/harness2/records/` for the current improvement cycle. Use Pi to work on tasks first, then run `/harness2` or `/harness2 propose`.",
         "warning"
       );
       return;
@@ -259,14 +260,14 @@ export default function registerHarness2Extension(pi: PiExtensionAPI): void {
 
   // 1. Pre-Compaction Hook (`session_before_compact`):
   // When `recordMode: "auto"` is active, records unrecorded turns using `event.branchEntries`
-  // before compaction runs (without cancelling Pi's normal compaction).
+  // before compaction runs (without cancelling Pi's normal compaction or blocking on an interactive TUI).
   pi.on(
     "session_before_compact",
     async (event: PiSessionBeforeCompactEvent, ctx: PiCommandContext) => {
       const workspaceDir = ctx?.cwd ?? process.cwd();
       const config = loadHarness2Config(workspaceDir);
       if (config.recordMode === "auto") {
-        await handleRecordAndCheck(ctx, undefined, true, event?.branchEntries);
+        await handleRecordAndCheck(ctx, undefined, true, event?.branchEntries, true);
       }
       return undefined;
     }
@@ -320,8 +321,7 @@ export default function registerHarness2Extension(pi: PiExtensionAPI): void {
       );
       await runGuidedProposalReview(workspaceDir, proposal, state, ctx);
     } else {
-      state.snoozeUntilSessionCount =
-        state.counters.sessionsSinceLastProposal + 1;
+      snoozeProposalForOneSession(state);
       saveWorkspaceState(workspaceDir, state);
       ctx.ui.notify("Harness² proposal snoozed for 1 session.", "info");
     }

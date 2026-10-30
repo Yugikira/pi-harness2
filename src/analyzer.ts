@@ -191,7 +191,7 @@ export interface BuildDigestOptions {
  *
  * Inspired by Google Research's Harness² trajectory pre-processor and Pi's `serializeConversation()`:
  * 1. Restores all raw messages across the session (bridging across `type: "compaction"` entries so compacted messages are never lost).
- * 2. Filters out `context_edit` retracted turns and network/provider `stopReason: "error"` duplicate user retries.
+ * 2. Filters out `context_edit` retracted turns and network/provider `stopReason: "error"` or empty `stopReason: "aborted"` duplicate user retries.
  * 3. Strips `<thinking>` blocks, `<skill>` system prompt injections, and multi-megabyte base64 `image` blobs.
  * 4. Produces a compact `serializedTranscript` (~15–25 KB even for 3.7 MB raw `.jsonl` sessions) plus `MechanicalSessionFacts`
  *    so Stage 2 (`recordSessionWithModel` in `src/recorder.ts`) can ask the AI model to semantically judge all frictions.
@@ -288,13 +288,23 @@ export function buildSessionDigest(
         recentProviderErrorOrContextEdit = true;
         continue;
       }
-      if (msg.stopReason === "aborted" && recentProviderErrorOrContextEdit) {
-        continue;
-      }
 
       const contentParts = Array.isArray(msg.content) ? msg.content : [];
       const toolCalls = contentParts.filter((p) => p.type === "toolCall" && p.name);
       const assistantText = extractTextFromContent(msg.content);
+
+      if (msg.stopReason === "aborted" && !assistantText && toolCalls.length === 0) {
+        recentProviderErrorOrContextEdit = true;
+        continue;
+      }
+
+      if (msg.stopReason === "aborted" && recentProviderErrorOrContextEdit) {
+        continue;
+      }
+
+      if (assistantText || toolCalls.length > 0) {
+        recentProviderErrorOrContextEdit = false;
+      }
 
       if (assistantText) {
         transcriptLines.push(
